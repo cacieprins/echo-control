@@ -1,0 +1,12 @@
+name: echo-control
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: echo-control-qdrant
+    network_mode: host
+    volumes:
+      - "@DATA_DIR@/qdrant:/qdrant/storage"
+    environment:
+      QDRANT__SERVICE__HOST: "127.0.0.1"
+      QDRANT__TELEMETRY_DISABLED: "true"

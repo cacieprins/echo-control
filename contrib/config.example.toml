@@ -1,0 +1,30 @@
+# Copy to ~/.config/echo-control/config.toml
+
+[library]
+paths = ["~/Music"]
+extensions = ["mp3", "flac", "ogg", "opus", "m4a", "wav", "aac", "wma", "aiff"]
+rescan_interval = "6h"
+exclude = []           # directories to skip; [player].spotatui_dir is always skipped
+
+[model]
+# laion/larger_clap_music ships untrained projection weights on Hugging Face; don't use it.
+name = "laion/larger_clap_music_and_speech"
+device = "auto"        # auto | cpu | cuda (ROCm GPUs report as cuda)
+batch_size = 8
+windows = 3            # 10s clips sampled per track, averaged
+window_seconds = 10.0
+text_prefix = "A recording of "   # prepended to queries unless already present; "" to disable
+
+[qdrant]
+url = "http://localhost:6333"
+collection = "echo_control"
+ready_timeout = 60     # seconds to wait for qdrant at daemon startup
+
+[player]
+backend = "mpv"        # mpv | spotatui | command | stdout
+limit = 25
+command = "mpv --playlist={m3u}"   # used by backend = "command"; {m3u} or {paths}
+# spotatui has no CLI for local playlists; results become a folder of ordered symlinks here,
+# which its Local Files source lists as a playlist. Must be under spotatui's local_music_path.
+spotatui_dir = "~/Music/vibe-playlists"
+spotatui_keep = 10

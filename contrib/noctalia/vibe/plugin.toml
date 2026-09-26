@@ -1,0 +1,47 @@
+id = "case/vibe"
+name = "Vibe"
+version = "0.1.0"
+plugin_api = 9
+author = "case"
+license = "MIT"
+icon = "music"
+description = "Search your local music library by how it sounds (CLAP + Qdrant via echo-control). Type /vibe followed by a description."
+tags = ["launcher", "music", "media"]
+dependencies = ["vibe"]
+
+[[setting]]
+key = "max_results"
+type = "int"
+label_key = "settings.max_results.label"
+description_key = "settings.max_results.description"
+default = 15
+min = 1
+max = 100
+
+[[setting]]
+key = "player"
+type = "select"
+label_key = "settings.player.label"
+description_key = "settings.player.description"
+default = "mpv"
+options = [
+  { value = "mpv", label_key = "settings.player.options.mpv" },
+  { value = "spotatui", label_key = "settings.player.options.spotatui" },
+  { value = "command", label_key = "settings.player.options.command" },
+]
+
+[[setting]]
+key = "vibe_path"
+type = "string"
+label_key = "settings.vibe_path.label"
+description_key = "settings.vibe_path.description"
+default = ""
+advanced = true
+
+[[launcher_provider]]
+id = "provider"
+entry = "vibe.luau"
+prefix = "vibe"
+glyph = "music"
+include_in_global_search = false
+debounce_ms = 400

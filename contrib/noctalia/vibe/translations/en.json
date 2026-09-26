@@ -1,0 +1,32 @@
+{
+  "hint": "Describe the music",
+  "hint-subtitle": "e.g. angsty lesbian music from the late 20th century",
+  "searching": "Searching…",
+  "searching-subtitle": "Embedding \"{query}\" with CLAP",
+  "play-all": "Play all {count} tracks",
+  "play-all-subtitle": "\"{query}\" with {player}",
+  "no-results": "No matches",
+  "no-results-subtitle": "Is the library indexed? Run: echo-control status",
+  "error": "vibe failed",
+  "not-installed": "vibe not found",
+  "not-installed-subtitle": "Install echo-control or set the vibe path in plugin settings",
+  "settings": {
+    "max_results": {
+      "label": "Maximum results",
+      "description": "Number of tracks to show and play."
+    },
+    "player": {
+      "label": "Player",
+      "description": "Backend used when a result is activated.",
+      "options": {
+        "mpv": "mpv",
+        "spotatui": "spotatui (playlist folder)",
+        "command": "Custom command from echo-control config"
+      }
+    },
+    "vibe_path": {
+      "label": "vibe executable",
+      "description": "Full path to vibe if it is not on the shell's PATH. Empty uses vibe or ~/.local/bin/vibe."
+    }
+  }
+}

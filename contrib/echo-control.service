@@ -1,0 +1,17 @@
+[Unit]
+Description=echo-control CLAP music indexer
+Requires=echo-control-qdrant.service
+After=echo-control-qdrant.service
+
+[Service]
+Type=simple
+ExecStart=@EXE@ daemon
+Restart=on-failure
+RestartSec=10
+Nice=10
+IOSchedulingClass=idle
+Environment=PYTHONUNBUFFERED=1
+Environment=TOKENIZERS_PARALLELISM=false
+
+[Install]
+WantedBy=default.target

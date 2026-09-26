@@ -1,0 +1,38 @@
+[project]
+name = "echo-control"
+version = "0.1.0"
+description = "Search a local music library by vibe with CLAP embeddings and Qdrant"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch==2.14.0",
+    "triton-rocm==3.8.0; sys_platform == 'linux'",
+    "transformers>=4.44",
+    "librosa>=0.10",
+    "soundfile>=0.12",
+    "qdrant-client>=1.12",
+    "watchdog>=5.0",
+]
+
+[project.scripts]
+vibe = "echo_control.cli:vibe"
+echo-control = "echo_control.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/echo_control"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"contrib" = "echo_control/contrib"
+
+[tool.uv.sources]
+torch = { index = "pytorch-rocm" }
+triton-rocm = { index = "pytorch-rocm" }
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.2"
+explicit = true

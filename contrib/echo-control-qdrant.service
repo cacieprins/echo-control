@@ -1,0 +1,14 @@
+[Unit]
+Description=Qdrant vector database for echo-control (docker)
+
+[Service]
+Type=simple
+ExecStartPre=-@DOCKER@ compose -f @COMPOSE@ pull --quiet
+ExecStart=@DOCKER@ compose -f @COMPOSE@ up --remove-orphans
+ExecStop=@DOCKER@ compose -f @COMPOSE@ down
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target
