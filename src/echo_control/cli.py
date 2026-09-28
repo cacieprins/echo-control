@@ -79,12 +79,23 @@ def vibe(argv: list[str] | None = None) -> None:
         "(default 1; 0 = plain --wander)",
     )
     p.add_argument("--from", dest="seed", metavar="FILE", help="seed track for --wander/--orbit")
+    p.add_argument(
+        "--continuous",
+        action="store_true",
+        help="keep wandering (or orbiting) forever in mpv, queueing tracks as they play",
+    )
     args = p.parse_args(argv)
     if args.orbit is not None:
         if args.orbit < 0:
             _die("--orbit strength can't be negative", 2)
         args.wander = True
+    if args.continuous:
+        args.wander = True
+        if args.json or args.print:
+            _die("--continuous plays in mpv; it can't be combined with --json or --print", 2)
     cfg = config_mod.load()
+    if args.continuous and (args.player or cfg.player.backend) != "mpv":
+        _die("--continuous needs the mpv player", 2)
 
     if args.play_path:
         backend = args.player or cfg.player.backend
@@ -132,7 +143,7 @@ def vibe(argv: list[str] | None = None) -> None:
         seed = hits[0].path if hits else ""
         scores = [(h.path, h.score) for h in hits]
     if args.wander:
-        from .wander import Orbit, wander
+        from .wander import Orbit, walk, wander
 
         found = store.track(seed)
         if found is None:
@@ -140,6 +151,15 @@ def vibe(argv: list[str] | None = None) -> None:
         orbit = None
         if args.orbit:
             orbit = Orbit(vector or found[1]["mean"].tolist(), args.orbit)
+        if args.continuous:
+            from .players import play_mpv_continuous
+
+            steps = (t.path for t in walk(store, seed, cfg.wander, orbit))
+            try:
+                play_mpv_continuous(steps, query or f"wander from {Path(seed).stem}", args.detach)
+            except PlayerError as e:
+                _die(str(e))
+            return
         chain = wander(store, seed, limit, cfg.wander, orbit)
         scores = [(t.path, t.score) for t in chain]
 

@@ -5,7 +5,9 @@ circles a vibe instead of drifting off."""
 
 from __future__ import annotations
 
+import itertools
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -98,10 +100,11 @@ def rank_next(
     return out
 
 
-def wander(
-    store: ChunkStore, seed: str, length: int, cfg: WanderConfig, orbit: Orbit | None = None
-) -> list[Transition]:
-    """Greedy walk from seed; the seed is the first entry, with a score of 0."""
+def walk(
+    store: ChunkStore, seed: str, cfg: WanderConfig, orbit: Orbit | None = None
+) -> Iterator[Transition]:
+    """Greedy walk from seed, one step at a time, until nothing unplayed is left; the seed
+    comes first, with a score of 0."""
     found = store.track(seed)
     if found is None:
         raise KeyError(seed)
@@ -109,9 +112,13 @@ def wander(
     chain = [Transition(
         seed, 0.0, 0.0, 0.0, 0.0, mean=vecs["mean"], duration=float(payload.get("duration") or 0.0)
     )]
-    while len(chain) < length:
-        ranked = rank_next(store, chain, cfg, orbit)
-        if not ranked:
-            break
+    yield chain[0]
+    while ranked := rank_next(store, chain, cfg, orbit):
         chain.append(ranked[0])
-    return chain
+        yield ranked[0]
+
+
+def wander(
+    store: ChunkStore, seed: str, length: int, cfg: WanderConfig, orbit: Orbit | None = None
+) -> list[Transition]:
+    return list(itertools.islice(walk(store, seed, cfg, orbit), length))

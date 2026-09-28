@@ -1,18 +1,27 @@
 from __future__ import annotations
 
+import itertools
+import json
 import os
 import re
 import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
-from .config import DATA_DIR, PlayerConfig
+from .config import DATA_DIR, PlayerConfig, socket_path
 
 BACKENDS = ("mpv", "spotatui", "command", "stdout")
+CONTINUOUS_AHEAD = 3
+# mpv only opens a window for a video track, and cover art counts as one; without this the
+# window closes on every track that has no art.
+MPV_WINDOW = ("--force-window=immediate",)
 
 
 class PlayerError(RuntimeError):
@@ -59,10 +68,113 @@ def _slug(text: str, limit: int = 60) -> str:
 def play_mpv(paths: list[str], title: str, detach: bool) -> None:
     if not shutil.which("mpv"):
         raise PlayerError("mpv is not installed (pacman -S mpv), or pick another --player")
-    argv = ["mpv", f"--playlist={write_m3u(paths, title)}", f"--title=vibe: {title}"]
+    argv = [
+        "mpv",
+        f"--playlist={write_m3u(paths, title)}",
+        f"--title=vibe: {title}",
+        *MPV_WINDOW,
+    ]
     if detach:
         argv.append("--player-operation-mode=pseudo-gui")
     _spawn(argv, detach)
+
+
+class _MpvIpc:
+    """Just enough of mpv's JSON IPC to read properties and append files."""
+
+    def __init__(self, path: Path, proc: subprocess.Popen, timeout: float = 15.0):
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.connect(str(path))
+                break
+            except (FileNotFoundError, ConnectionRefusedError):
+                self.sock.close()
+                if proc.poll() is not None or time.monotonic() > deadline:
+                    raise PlayerError("mpv exited before its IPC socket came up") from None
+                time.sleep(0.1)
+        self.buf = b""
+        self.next_id = 0
+
+    def command(self, *args):
+        self.next_id += 1
+        rid = self.next_id
+        self.sock.sendall(json.dumps({"command": list(args), "request_id": rid}).encode() + b"\n")
+        while True:
+            while b"\n" not in self.buf:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    raise ConnectionError("mpv closed its IPC socket")
+                self.buf += chunk
+            line, self.buf = self.buf.split(b"\n", 1)
+            msg = json.loads(line)
+            if msg.get("request_id") == rid:
+                if msg.get("error") != "success":
+                    raise PlayerError(f"mpv {args[0]}: {msg.get('error')}")
+                return msg.get("data")
+
+
+def _interrupt(_signum, _frame) -> None:
+    raise KeyboardInterrupt
+
+
+def play_mpv_continuous(
+    tracks: Iterator[str], title: str, detach: bool, ahead: int = CONTINUOUS_AHEAD
+) -> None:
+    """Play tracks as an endless mpv playlist, keeping `ahead` queued past the current one
+    and pulling more from the iterator as they play. Returns once mpv quits."""
+    if not shutil.which("mpv"):
+        raise PlayerError("mpv is not installed (pacman -S mpv), or pick another --player")
+    first = list(itertools.islice(tracks, ahead + 1))
+    if not first:
+        raise PlayerError("no results")
+    if detach:
+        if os.fork():
+            return
+        os.setsid()
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+    sock = socket_path().with_name(f"vibe-mpv-{os.getpid()}.sock")
+    argv = [
+        "mpv",
+        f"--playlist={write_m3u(first, title)}",
+        f"--title=vibe: {title}",
+        f"--input-ipc-server={sock}",
+        *MPV_WINDOW,
+    ]
+    if detach:
+        argv.append("--player-operation-mode=pseudo-gui")
+    proc = subprocess.Popen(argv)
+    signal.signal(signal.SIGTERM, _interrupt)
+    try:
+        ipc = _MpvIpc(sock, proc)
+        exhausted = False
+        while proc.poll() is None and not exhausted:
+            pos = ipc.command("get_property", "playlist-pos")
+            count = ipc.command("get_property", "playlist-count")
+            while count - max(pos, 0) - 1 < ahead:
+                path = next(tracks, None)
+                if path is None:
+                    exhausted = True
+                    break
+                ipc.command("loadfile", path, "append")
+                count += 1
+            time.sleep(1.0)
+        proc.wait()
+    except (ConnectionError, BrokenPipeError):
+        proc.wait()
+    except KeyboardInterrupt:
+        # Launchers like uv forward the same signal again; don't die mid-cleanup.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        proc.terminate()
+        proc.wait()
+    finally:
+        sock.unlink(missing_ok=True)
+        if detach:
+            os._exit(0)
 
 
 def play_spotatui(paths: list[str], title: str, cfg: PlayerConfig, detach: bool) -> None:

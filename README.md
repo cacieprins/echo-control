@@ -36,6 +36,10 @@ The first scan is slow on CPU; watch it with `journalctl --user -fu echo-control
 - `vibe --orbit[=N] "<query>"` is `--wander` with a pull back toward the query (or, with
   `--from FILE` and no query, toward that track). N is how tight the orbit is: 1 by
   default, 0 is plain `--wander`, higher stays closer to the vibe.
+- `vibe --continuous "<query>"` (with or without `--orbit`) wanders forever in mpv. `vibe`
+  stays running and keeps 3 tracks queued past the current one over mpv's IPC socket,
+  extending the walk as you listen. Quit mpv to stop. With `--detach`, the feeding runs in
+  the background. `-n` doesn't apply.
 - `echo-control daemon` runs the indexer/watcher and the text-embedding socket.
 - `echo-control scan` runs a one-off index pass without the daemon.
 - `echo-control reindex` drops the current strategy's index and rebuilds it.
