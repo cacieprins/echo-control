@@ -43,10 +43,22 @@ class LibraryConfig:
 class ModelConfig:
     name: str = "laion/larger_clap_music_and_speech"
     device: str = "auto"
+    precision: str = "bf16"
     batch_size: int = 8
     windows: int = 3
     window_seconds: float = 10.0
     text_prefix: str = "A recording of "
+    strategy: str = "clusters"
+    max_clusters: int = 4
+    min_cluster_share: float = 0.12
+    merge_threshold: float = 0.85
+    max_chunks: int = 60
+    silence_db: float = -45.0
+
+
+@dataclass
+class SearchConfig:
+    share_weight: float = 0.0
 
 
 @dataclass
@@ -71,6 +83,7 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     qdrant: QdrantConfig = field(default_factory=QdrantConfig)
     player: PlayerConfig = field(default_factory=PlayerConfig)
+    search: SearchConfig = field(default_factory=SearchConfig)
     path: Path | None = None
 
 
@@ -99,10 +112,15 @@ def load(path: Path | None = None) -> Config:
     # Generated spotatui playlists are symlinks into the library; never index them.
     library.exclude.append(player.spotatui_dir.expanduser().resolve())
 
+    model = ModelConfig(**raw.get("model", {}))
+    if model.strategy not in ("mean", "clusters"):
+        raise ValueError(f"[model] strategy must be 'mean' or 'clusters', not {model.strategy!r}")
+
     return Config(
         library=library,
-        model=ModelConfig(**raw.get("model", {})),
+        model=model,
         qdrant=QdrantConfig(**raw.get("qdrant", {})),
         player=player,
+        search=SearchConfig(**raw.get("search", {})),
         path=path if path.exists() else None,
     )

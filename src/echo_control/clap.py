@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from .config import ModelConfig
+from .segments import dense_chunks, summarize
 
 log = logging.getLogger(__name__)
 
@@ -28,8 +29,9 @@ def _split_short(audio: np.ndarray, windows: int, win: float) -> list[np.ndarray
 def _ffmpeg_windows(path: Path, windows: int, win: float) -> tuple[list[np.ndarray], float]:
     """Fallback for files libsndfile rejects (broken MP3 headers, odd containers)."""
     out = subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", str(path), "-ac", "1", "-ar", str(SAMPLE_RATE),
-         "-f", "f32le", "-"],
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-ac", "1",
+         "-ar", str(SAMPLE_RATE), "-f", "f32le", "-"],
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         check=True,
     ).stdout
@@ -71,16 +73,32 @@ def _librosa_windows(path: Path, windows: int, win: float) -> tuple[list[np.ndar
     return clips, duration
 
 
+def resolve_devices(setting: str) -> list[str]:
+    """Map the device setting to torch devices: auto means every visible GPU (ROCm reports
+    as cuda) or else the CPU; a comma-separated list like "cuda:0,cuda:1" is used as given."""
+    import torch
+
+    if setting == "auto":
+        n = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        return [f"cuda:{i}" for i in range(n)] or ["cpu"]
+    return [d.strip() for d in setting.split(",") if d.strip()]
+
+
+def load_encoders(cfg: ModelConfig) -> list[Clap]:
+    """One model replica per device; the first also serves text queries."""
+    return [Clap(cfg, device) for device in resolve_devices(cfg.device)]
+
+
 class Clap:
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, device: str | None = None):
+        import threading
+
         import torch
         from transformers import ClapModel, ClapProcessor
 
         self.cfg = cfg
-        if cfg.device == "auto":
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        else:
-            self.device = cfg.device
+        self.device = device or resolve_devices(cfg.device)[0]
+        self.lock = threading.Lock()
         log.info("loading %s on %s", cfg.name, self.device)
         self.torch = torch
         self.processor = ClapProcessor.from_pretrained(cfg.name)
@@ -91,7 +109,7 @@ class Clap:
     def _features(out) -> np.ndarray:
         # transformers >= 5 wraps projected embeddings in a model output
         tensor = out if hasattr(out, "cpu") else out.pooler_output
-        return tensor.detach().cpu().numpy()
+        return tensor.detach().float().cpu().numpy()
 
     @staticmethod
     def _normalize(v: np.ndarray) -> np.ndarray:
@@ -117,27 +135,91 @@ class Clap:
             emb = self.model.get_text_features(**inputs)
         return self._normalize(self._features(emb))[0].tolist()
 
+    def _gpu_features_supported(self) -> bool:
+        fe = self.processor.feature_extractor
+        return fe.truncation == "rand_trunc" and fe.padding == "repeatpad"
+
+    def _log_mel(self, clips: list[np.ndarray]) -> dict:
+        """Same features as ClapFeatureExtractor (rand_trunc + repeatpad), computed with
+        torch.stft on the model's device instead of numpy on the CPU."""
+        torch = self.torch
+        fe = self.processor.feature_extractor
+        max_len = fe.nb_max_samples
+        batch = np.zeros((len(clips), max_len), dtype=np.float32)
+        for i, clip in enumerate(clips):
+            clip = clip[:max_len]
+            if 0 < len(clip) < max_len:
+                clip = np.tile(clip, max_len // len(clip))
+            batch[i, : len(clip)] = clip
+        if not hasattr(self, "_mel_fb"):
+            self._mel_fb = torch.from_numpy(fe.mel_filters_slaney.astype(np.float32)).to(self.device)
+            self._window = torch.hann_window(fe.fft_window_size, periodic=True, device=self.device)
+        x = torch.from_numpy(batch).to(self.device)
+        spec = torch.stft(
+            x,
+            n_fft=fe.fft_window_size,
+            hop_length=fe.hop_length,
+            window=self._window,
+            center=True,
+            pad_mode="reflect",
+            return_complex=True,
+        ).abs().pow(2)
+        mel = torch.einsum("fm,bft->btm", self._mel_fb, spec)
+        db = 10 * torch.log10(mel.clamp(min=1e-10))
+        return {
+            "input_features": db[:, None],
+            "is_longer": torch.zeros((len(clips), 1), dtype=torch.bool, device=self.device),
+        }
+
     def embed_clips(self, clips: list[np.ndarray]) -> np.ndarray:
         out = []
         bs = max(self.cfg.batch_size, 1)
+        gpu_features = self._gpu_features_supported()
+        # fp16 overflows to NaN in this model; bf16 matches fp32 to cosine > 0.999.
+        autocast = self.torch.autocast(
+            "cuda",
+            dtype=self.torch.bfloat16,
+            enabled=self.device.startswith("cuda") and self.cfg.precision == "bf16",
+        )
         for i in range(0, len(clips), bs):
             batch = clips[i : i + bs]
-            inputs = self.processor(
-                audio=batch, sampling_rate=SAMPLE_RATE, return_tensors="pt"
-            ).to(self.device)
-            with self.torch.inference_mode():
+            with self.torch.inference_mode(), autocast:
+                if gpu_features:
+                    inputs = self._log_mel(batch)
+                else:
+                    inputs = self.processor(
+                        audio=batch, sampling_rate=SAMPLE_RATE, return_tensors="pt"
+                    ).to(self.device)
                 emb = self.model.get_audio_features(**inputs)
             out.append(self._features(emb))
         return self._normalize(np.concatenate(out))
 
-    def decode(self, path: Path) -> tuple[list[np.ndarray], float]:
-        return load_windows(path, self.cfg.windows, self.cfg.window_seconds)
+    @property
+    def signature(self) -> str:
+        """Identifies the embedding settings; tracks indexed under another one get redone."""
+        c = self.cfg
+        if c.strategy == "mean":
+            return f"{c.name}|mean|{c.windows}x{c.window_seconds:g}"
+        return (
+            f"{c.name}|clusters|{c.window_seconds:g}|{c.max_chunks}|{c.silence_db:g}"
+            f"|{c.max_clusters}|{c.min_cluster_share:g}|{c.merge_threshold:g}"
+        )
 
-    def embed_decoded(self, clips: list[np.ndarray]) -> list[float]:
+    def decode(self, path: Path) -> tuple[list[np.ndarray], float]:
+        c = self.cfg
+        if c.strategy == "mean":
+            return load_windows(path, c.windows, c.window_seconds)
+        return dense_chunks(path, c.window_seconds, c.max_chunks, c.silence_db)
+
+    def embed_decoded(self, clips: list[np.ndarray]) -> tuple[list[list[float]], list[float]]:
+        """Returns the track's vectors and the share of the track each one represents."""
         if not clips:
             raise ValueError("no decodable audio")
-        return self._normalize(self.embed_clips(clips).mean(axis=0)).tolist()
-
-    def embed_audio(self, path: Path) -> tuple[list[float], float]:
-        clips, duration = self.decode(path)
-        return self.embed_decoded(clips), duration
+        embs = self.embed_clips(clips)
+        c = self.cfg
+        if c.strategy == "mean":
+            return [self._normalize(embs.mean(axis=0)).tolist()], [1.0]
+        centroids, shares = summarize(
+            embs, c.max_clusters, c.min_cluster_share, c.merge_threshold
+        )
+        return centroids.tolist(), [round(float(s), 4) for s in shares]

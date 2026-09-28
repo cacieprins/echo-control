@@ -12,7 +12,7 @@ from pathlib import Path
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from .clap import Clap
+from .clap import load_encoders
 from .config import Config, socket_path
 from .indexer import Indexer, is_audio
 from .store import Store, point_id, wait_ready
@@ -50,9 +50,10 @@ class Daemon:
         self.state = {"started": time.time(), "scanning": False, "last_scan": None}
 
         wait_ready(cfg.qdrant.url, cfg.qdrant.ready_timeout)
-        self.clap = Clap(cfg.model)
+        self.encoders = load_encoders(cfg.model)
+        self.clap = self.encoders[0]
         self.store = Store(cfg.qdrant)
-        self.indexer = Indexer(cfg, self.clap, self.store)
+        self.indexer = Indexer(cfg, self.encoders, self.store)
 
     def touch(self, path: Path) -> None:
         if is_audio(path, self.cfg):
@@ -94,15 +95,11 @@ class Daemon:
                     self.indexer.remove([p])
                     log.info("removed %s", p)
 
-    def _known(self, paths: list[Path]) -> dict[str, tuple[float, int]]:
+    def _known(self, paths: list[Path]) -> dict:
         points = self.store.client.retrieve(
             self.store.collection, ids=[point_id(str(p)) for p in paths], with_payload=True
         )
-        return {
-            pt.payload["path"]: (pt.payload.get("mtime"), pt.payload.get("size"))
-            for pt in points
-            if pt.payload
-        }
+        return {pt.payload["path"]: self.indexer.state_key(pt.payload) for pt in points if pt.payload}
 
     def handle(self, req: dict) -> dict:
         op = req.get("op")
@@ -114,8 +111,9 @@ class Daemon:
             return {
                 **self.state,
                 "pending": pending,
-                "device": self.clap.device,
+                "device": ", ".join(e.device for e in self.encoders),
                 "model": self.cfg.model.name,
+                "strategy": self.cfg.model.strategy,
                 "indexed": self.store.count(),
             }
         return {"error": f"unknown op {op!r}"}
@@ -171,6 +169,11 @@ class Daemon:
         server.server_close()
         sock.unlink(missing_ok=True)
         observer.join(timeout=5)
+        threads[0].join(timeout=30)
+        logging.shutdown()
+        # Normal interpreter teardown aborts inside ROCm/OpenBLAS worker threads (SIGABRT
+        # core dump); every upsert is already committed, so skip it.
+        os._exit(0)
 
 
 def request(req: dict, timeout: float = 30.0) -> dict | None:

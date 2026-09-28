@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 import urllib.error
 import urllib.request
@@ -7,9 +8,12 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 
+import numpy as np
 from qdrant_client import QdrantClient, models
 
 from .config import QdrantConfig
+
+log = logging.getLogger(__name__)
 
 _NS = uuid.UUID("5f0c7c1e-6d7a-4f55-9d0e-6563686f6374")
 
@@ -54,14 +58,25 @@ class Store:
         self.client = QdrantClient(url=cfg.url, timeout=30)
 
     def ensure(self, dim: int) -> None:
-        if not self.client.collection_exists(self.collection):
-            self.client.create_collection(
-                self.collection,
-                vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
+        if self.client.collection_exists(self.collection):
+            vectors = self.client.get_collection(self.collection).config.params.vectors
+            if getattr(vectors, "multivector_config", None) is not None:
+                return
+            log.warning(
+                "collection %r uses the old single-vector layout; recreating it", self.collection
             )
-            self.client.create_payload_index(
-                self.collection, "path", models.PayloadSchemaType.KEYWORD
-            )
+            self.client.delete_collection(self.collection)
+        self.client.create_collection(
+            self.collection,
+            vectors_config=models.VectorParams(
+                size=dim,
+                distance=models.Distance.COSINE,
+                multivector_config=models.MultiVectorConfig(
+                    comparator=models.MultiVectorComparator.MAX_SIM
+                ),
+            ),
+        )
+        self.client.create_payload_index(self.collection, "path", models.PayloadSchemaType.KEYWORD)
 
     def drop(self) -> None:
         if self.client.collection_exists(self.collection):
@@ -75,10 +90,10 @@ class Store:
             return 0
         return self.client.count(self.collection, exact=True).count
 
-    def upsert(self, path: str, vector: list[float], payload: dict) -> None:
+    def upsert(self, path: str, vectors: list[list[float]], payload: dict) -> None:
         self.client.upsert(
             self.collection,
-            points=[models.PointStruct(id=point_id(path), vector=vector, payload=payload)],
+            points=[models.PointStruct(id=point_id(path), vector=vectors, payload=payload)],
         )
 
     def delete_paths(self, paths: list[str]) -> None:
@@ -99,11 +114,28 @@ class Store:
             if offset is None:
                 break
 
-    def search(self, vector: list[float], limit: int) -> list[Hit]:
+    def search(self, vector: list[float], limit: int, share_weight: float = 0.0) -> list[Hit]:
+        """MaxSim over each track's vectors. With share_weight > 0, candidates are re-ranked
+        by max(similarity * share ** share_weight), so a vector covering a sliver of a track
+        (a bridge, one section of a DJ mix) counts for less than one covering most of it."""
+        rerank = share_weight > 0
         res = self.client.query_points(
-            self.collection, query=vector, limit=limit, with_payload=True
+            self.collection,
+            query=[vector],
+            limit=limit * 3 if rerank else limit,
+            with_payload=True,
+            with_vectors=rerank,
         )
-        return [
-            Hit(path=p.payload["path"], score=p.score, duration=p.payload.get("duration"))
-            for p in res.points
-        ]
+        hits = []
+        q = np.asarray(vector, dtype=np.float32)
+        for p in res.points:
+            score = p.score
+            if rerank:
+                sims = np.asarray(p.vector, dtype=np.float32) @ q
+                shares = np.asarray(p.payload.get("shares") or [1.0] * len(sims))
+                if len(shares) == len(sims):
+                    score = float(np.max(sims * shares**share_weight))
+            hits.append(Hit(path=p.payload["path"], score=score, duration=p.payload.get("duration")))
+        if rerank:
+            hits.sort(key=lambda h: -h.score)
+        return hits[:limit]

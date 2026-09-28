@@ -9,16 +9,33 @@ exclude = []           # directories to skip; [player].spotatui_dir is always sk
 [model]
 # laion/larger_clap_music ships untrained projection weights on Hugging Face; don't use it.
 name = "laion/larger_clap_music_and_speech"
-device = "auto"        # auto | cpu | cuda (ROCm GPUs report as cuda)
+device = "auto"        # auto = every GPU (ROCm reports as cuda), else cpu; or "cuda:0,cuda:1"
+precision = "bf16"     # bf16 | fp32 for audio on GPU; bf16 is ~4x faster (fp16 produces NaNs)
 batch_size = 8
-windows = 3            # 10s clips sampled per track, averaged
 window_seconds = 10.0
+# How a track becomes vectors. Changing any of these re-embeds the library on the next scan.
+#   clusters: embed every 10s chunk, k-means them, store up to max_clusters centroids per
+#             track; a query matches a track's best section.
+#   mean:     average `windows` evenly spaced clips into a single vector (faster, blurrier).
+strategy = "clusters"
+max_clusters = 4
+min_cluster_share = 0.12  # drop sections covering less of the track than this (intros, applause)
+merge_threshold = 0.85    # merge centroids at least this similar; uniform tracks end up with one
+max_chunks = 60           # longer tracks are subsampled evenly to this many chunks
+silence_db = -45.0        # chunks quieter than this (RMS dBFS) are ignored
+windows = 3               # mean strategy only
 text_prefix = "A recording of "   # prepended to queries unless already present; "" to disable
 
 [qdrant]
 url = "http://localhost:6333"
 collection = "echo_control"
 ready_timeout = 60     # seconds to wait for qdrant at daemon startup
+
+[search]
+# Re-rank by max(similarity * share ** share_weight), where share is how much of the track a
+# centroid covers. 0 = pure best-section match (best in testing); 0.5 already over-rewards
+# uniform tracks.
+share_weight = 0.0
 
 [player]
 backend = "mpv"        # mpv | spotatui | command | stdout

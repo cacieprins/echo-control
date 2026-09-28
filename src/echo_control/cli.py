@@ -94,7 +94,7 @@ def vibe(argv: list[str] | None = None) -> None:
         vector = _embed_text(cfg, query)
     except RuntimeError as e:
         _die(f"embedding failed: {e}")
-    hits = store.search(vector, args.limit or cfg.player.limit)
+    hits = store.search(vector, args.limit or cfg.player.limit, cfg.search.share_weight)
 
     if args.json:
         out = [
@@ -142,12 +142,12 @@ def cmd_daemon(cfg: config_mod.Config, _args) -> None:
 
 def cmd_scan(cfg: config_mod.Config, _args) -> None:
     _setup_logging()
-    from .clap import Clap
+    from .clap import load_encoders
     from .indexer import Indexer
     from .store import Store, wait_ready
 
     wait_ready(cfg.qdrant.url, cfg.qdrant.ready_timeout)
-    total, added, removed = Indexer(cfg, Clap(cfg.model), Store(cfg.qdrant)).scan()
+    total, added, removed = Indexer(cfg, load_encoders(cfg.model), Store(cfg.qdrant)).scan()
     print(f"{total} files, {added} indexed, {removed} removed")
 
 
@@ -188,7 +188,7 @@ def cmd_status(cfg: config_mod.Config, _args) -> None:
 
             print(f"indexed: {Store(cfg.qdrant).count()} tracks")
         return
-    print(f"daemon:  running ({st['model']} on {st['device']})")
+    print(f"daemon:  running ({st['model']} on {st['device']}, {st.get('strategy', 'mean')} strategy)")
     print(f"indexed: {st['indexed']} tracks")
     scan = st.get("last_scan")
     if st["scanning"]:
