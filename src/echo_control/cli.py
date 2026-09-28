@@ -63,7 +63,27 @@ def vibe(argv: list[str] | None = None) -> None:
     p.add_argument("--json", action="store_true", help="print results as JSON, don't play")
     p.add_argument("--detach", action="store_true", help="start the player in the background")
     p.add_argument("--play-path", metavar="FILE", nargs="+", help="play these files, no search")
+    p.add_argument(
+        "--wander",
+        action="store_true",
+        help="start from the best match (or --from) and chain tracks whose intros continue "
+        "the previous outro (chunks strategy only)",
+    )
+    p.add_argument(
+        "--orbit",
+        nargs="?",
+        const=1.0,
+        type=float,
+        metavar="N",
+        help="--wander, pulled back toward the query (or the --from track) with strength N "
+        "(default 1; 0 = plain --wander)",
+    )
+    p.add_argument("--from", dest="seed", metavar="FILE", help="seed track for --wander/--orbit")
     args = p.parse_args(argv)
+    if args.orbit is not None:
+        if args.orbit < 0:
+            _die("--orbit strength can't be negative", 2)
+        args.wander = True
     cfg = config_mod.load()
 
     if args.play_path:
@@ -76,41 +96,68 @@ def vibe(argv: list[str] | None = None) -> None:
 
     if len(args.query) > 1:
         _die(f'put the query in quotes, e.g. vibe "{" ".join(args.query)}"', 2)
-    if not args.query or not args.query[0].strip():
+    if args.seed and not args.wander:
+        _die("--from only applies to --wander and --orbit", 2)
+    if args.wander and args.shuffle:
+        _die("--shuffle would undo the walk's ordering", 2)
+    if args.wander and cfg.model.strategy != "chunks":
+        _die('--wander and --orbit need [model] strategy = "chunks"', 2)
+    query = args.query[0].strip() if args.query else ""
+    if not query and not args.seed:
         p.print_usage(sys.stderr)
         sys.exit(2)
-    query = args.query[0].strip()
 
     if not is_ready(cfg.qdrant.url):
         _die(f"Qdrant not reachable at {cfg.qdrant.url} (systemctl --user start echo-control)")
 
-    from .store import Store
+    from .store import open_store
 
-    store = Store(cfg.qdrant)
+    store = open_store(cfg)
     if not store.exists():
         _die("the index is empty; start the daemon or run `echo-control scan`")
 
-    try:
-        vector = _embed_text(cfg, query)
-    except RuntimeError as e:
-        _die(f"embedding failed: {e}")
-    hits = store.search(vector, args.limit or cfg.player.limit, cfg.search.share_weight)
+    limit = args.limit or cfg.player.limit
+    vector = None
+    if query:
+        try:
+            vector = _embed_text(cfg, query)
+        except RuntimeError as e:
+            _die(f"embedding failed: {e}")
+    if args.seed:
+        seed = str(Path(args.seed).expanduser().resolve())
+    else:
+        hits = store.search(vector, 1 if args.wander else limit, cfg.search.share_weight)
+        if args.wander and not hits:
+            _die("nothing matched to start wandering from")
+        seed = hits[0].path if hits else ""
+        scores = [(h.path, h.score) for h in hits]
+    if args.wander:
+        from .wander import Orbit, wander
+
+        found = store.track(seed)
+        if found is None:
+            _die(f"{seed} isn't in the chunk index")
+        orbit = None
+        if args.orbit:
+            orbit = Orbit(vector or found[1]["mean"].tolist(), args.orbit)
+        chain = wander(store, seed, limit, cfg.wander, orbit)
+        scores = [(t.path, t.score) for t in chain]
 
     if args.json:
         out = [
             {
-                "path": h.path,
-                "name": Path(h.path).stem,
-                "dir": _relative_dir(Path(h.path), cfg.library.paths),
-                "score": round(h.score, 4),
+                "path": path,
+                "name": Path(path).stem,
+                "dir": _relative_dir(Path(path), cfg.library.paths),
+                "score": round(score, 4),
             }
-            for h in hits
+            for path, score in scores
         ]
         json.dump(out, sys.stdout)
         sys.stdout.write("\n")
         return
 
-    paths = [h.path for h in hits]
+    paths = [path for path, _ in scores]
     if args.shuffle:
         random.shuffle(paths)
     if args.print or not (sys.stdout.isatty() or args.detach or args.player):
@@ -118,7 +165,7 @@ def vibe(argv: list[str] | None = None) -> None:
     else:
         backend = args.player or cfg.player.backend
     try:
-        play(backend, paths, query, cfg.player, args.detach)
+        play(backend, paths, query or f"wander from {Path(seed).stem}", cfg.player, args.detach)
     except PlayerError as e:
         _die(str(e))
 
@@ -144,19 +191,19 @@ def cmd_scan(cfg: config_mod.Config, _args) -> None:
     _setup_logging()
     from .clap import load_encoders
     from .indexer import Indexer
-    from .store import Store, wait_ready
+    from .store import open_store, wait_ready
 
     wait_ready(cfg.qdrant.url, cfg.qdrant.ready_timeout)
-    total, added, removed = Indexer(cfg, load_encoders(cfg.model), Store(cfg.qdrant)).scan()
+    total, added, removed = Indexer(cfg, load_encoders(cfg.model), open_store(cfg)).scan()
     print(f"{total} files, {added} indexed, {removed} removed")
 
 
 def cmd_reindex(cfg: config_mod.Config, args) -> None:
-    from .store import Store, wait_ready
+    from .store import open_store, wait_ready
 
     wait_ready(cfg.qdrant.url, cfg.qdrant.ready_timeout)
-    Store(cfg.qdrant).drop()
-    print(f"dropped collection {cfg.qdrant.collection!r}")
+    open_store(cfg).drop()
+    print(f"dropped the {cfg.model.strategy} index for {cfg.qdrant.collection!r}")
     from .daemon import request
 
     try:
@@ -184,9 +231,9 @@ def cmd_status(cfg: config_mod.Config, _args) -> None:
     if st is None:
         print("daemon:  not running")
         if ready:
-            from .store import Store
+            from .store import open_store
 
-            print(f"indexed: {Store(cfg.qdrant).count()} tracks")
+            print(f"indexed: {open_store(cfg).count()} tracks")
         return
     print(f"daemon:  running ({st['model']} on {st['device']}, {st.get('strategy', 'mean')} strategy)")
     print(f"indexed: {st['indexed']} tracks")

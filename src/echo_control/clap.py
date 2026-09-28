@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from .config import ModelConfig
-from .segments import dense_chunks, summarize
+from .segments import Windows, dense_chunks, sliding_chunks, summarize
 
 log = logging.getLogger(__name__)
 
@@ -200,16 +200,33 @@ class Clap:
         c = self.cfg
         if c.strategy == "mean":
             return f"{c.name}|mean|{c.windows}x{c.window_seconds:g}"
+        if c.strategy == "chunks":
+            return (
+                f"{c.name}|chunks|{c.window_seconds:g}|{c.hop_seconds:g}|{c.silence_db:g}"
+                f"|{c.edge_seconds:g}"
+            )
         return (
             f"{c.name}|clusters|{c.window_seconds:g}|{c.max_chunks}|{c.silence_db:g}"
             f"|{c.max_clusters}|{c.min_cluster_share:g}|{c.merge_threshold:g}"
         )
 
-    def decode(self, path: Path) -> tuple[list[np.ndarray], float]:
+    def decode(self, path: Path) -> tuple[list[np.ndarray] | Windows, float]:
         c = self.cfg
         if c.strategy == "mean":
             return load_windows(path, c.windows, c.window_seconds)
+        if c.strategy == "chunks":
+            return sliding_chunks(path, c.window_seconds, c.hop_seconds, c.silence_db)
         return dense_chunks(path, c.window_seconds, c.max_chunks, c.silence_db)
+
+    def embed_windows(self, windows: Windows) -> np.ndarray:
+        """One unit vector per window, in order. Windows are converted a batch at a time."""
+        if not len(windows):
+            raise ValueError("no decodable audio")
+        bs = max(self.cfg.batch_size, 1) * 16
+        return np.concatenate([
+            self.embed_clips([windows.clip(j) for j in range(i, min(i + bs, len(windows)))])
+            for i in range(0, len(windows), bs)
+        ])
 
     def embed_decoded(self, clips: list[np.ndarray]) -> tuple[list[list[float]], list[float]]:
         """Returns the track's vectors and the share of the track each one represents."""

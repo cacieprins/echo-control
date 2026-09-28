@@ -8,9 +8,13 @@ from collections.abc import Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
+
+from . import trajectory
 from .clap import Clap
 from .config import Config
-from .store import Store
+from .segments import Windows
+from .store import ChunkStore, Store
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +52,7 @@ def is_audio(path: Path, cfg: Config) -> bool:
 
 
 class Indexer:
-    def __init__(self, cfg: Config, encoders: list[Clap], store: Store):
+    def __init__(self, cfg: Config, encoders: list[Clap], store: Store | ChunkStore):
         self.cfg = cfg
         self.encoders = encoders
         self.clap = encoders[0]
@@ -82,13 +86,20 @@ class Indexer:
         if known is not None and known.get(key) == self.current_key(path):
             return False
         encoder = encoder or self.clap
+        chunked = self.cfg.model.strategy == "chunks"
         try:
             clips, duration = decoded.result() if decoded else self.clap.decode(path)
             with encoder.lock:
-                vectors, shares = encoder.embed_decoded(clips)
+                if chunked:
+                    vectors = encoder.embed_windows(clips)
+                else:
+                    vectors, shares = encoder.embed_decoded(clips)
         except Exception as e:
             log.warning("skipping %s: %s", path, e)
             return False
+        if chunked:
+            self._store_chunks(key, st, clips, vectors, duration)
+            return True
         self.store.upsert(
             key,
             vectors,
@@ -102,6 +113,55 @@ class Indexer:
             },
         )
         return True
+
+    def _store_chunks(
+        self, key: str, st: os.stat_result, windows: Windows, vectors: np.ndarray, duration: float
+    ) -> None:
+        spans = [windows.span(i) for i in range(len(windows))]
+        starts = np.array([s for s, _ in spans])
+        speed = trajectory.speeds(vectors, starts)
+        chunk_payloads = [
+            {
+                "path": key,
+                "idx": i,
+                "total": len(windows),
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "db": round(windows.db[i], 2),
+                "silent": windows.silent[i],
+                "speed": None if np.isnan(speed[i]) else round(float(speed[i]), 5),
+            }
+            for i, (start, end) in enumerate(spans)
+        ]
+        loud = ~np.array(windows.silent)
+        mean = vectors[loud].mean(axis=0) if loud.any() else vectors.mean(axis=0)
+        mean /= max(float(np.linalg.norm(mean)), 1e-12)
+        intro, outro = trajectory.edges(
+            vectors, starts, windows.silent, windows.db, self.cfg.model.edge_seconds
+        )
+        track_vectors = {"mean": mean.tolist()}
+        for name, edge in (("intro", intro), ("outro", outro)):
+            track_vectors[name] = edge.position.tolist()
+            if edge.direction is not None:
+                track_vectors[f"{name}_dir"] = edge.direction.tolist()
+        self.store.replace_track(
+            key,
+            vectors,
+            chunk_payloads,
+            track_vectors,
+            {
+                "intro_drift": round(intro.drift, 6),
+                "outro_drift": round(outro.drift, 6),
+                "path": key,
+                "mtime": st.st_mtime,
+                "size": st.st_size,
+                "duration": duration,
+                "embedding": self.clap.signature,
+                "n_chunks": len(windows),
+                "silent": not loud.any(),
+                **trajectory.summarize(vectors, starts, self.cfg.model.window_seconds),
+            },
+        )
 
     def remove(self, paths: Iterable[Path]) -> None:
         self.store.delete_paths([str(p) for p in paths])

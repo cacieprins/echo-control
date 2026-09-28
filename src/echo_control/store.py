@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 from qdrant_client import QdrantClient, models
 
-from .config import QdrantConfig
+from .config import Config, QdrantConfig
 
 log = logging.getLogger(__name__)
 
@@ -22,8 +22,16 @@ class QdrantUnavailable(RuntimeError):
     pass
 
 
+UPSERT_BATCH = 256
+TRACK_VECTORS = ("mean", "intro", "outro", "intro_dir", "outro_dir")
+
+
 def point_id(path: str) -> str:
     return str(uuid.uuid5(_NS, path))
+
+
+def chunk_id(path: str, idx: int) -> str:
+    return str(uuid.uuid5(_NS, f"{path}#{idx}"))
 
 
 @dataclass
@@ -31,6 +39,27 @@ class Hit:
     path: str
     score: float
     duration: float | None
+    start: float | None = None
+
+
+@dataclass
+class Candidate:
+    """A possible next track: its payload, how close its intro is, and its vectors."""
+
+    payload: dict
+    position: float
+    intro_dir: np.ndarray | None
+    mean: np.ndarray
+
+    @classmethod
+    def of(cls, payload: dict, position: float, vectors: dict) -> Candidate:
+        d = vectors.get("intro_dir")
+        return cls(
+            payload,
+            position,
+            None if d is None else np.asarray(d, np.float32),
+            np.asarray(vectors["mean"], np.float32),
+        )
 
 
 def is_ready(url: str) -> bool:
@@ -49,6 +78,30 @@ def wait_ready(url: str, timeout: float) -> None:
             raise QdrantUnavailable(f"Qdrant not reachable at {url} after {timeout:.0f}s")
         time.sleep(delay)
         delay = min(delay * 2, 5)
+
+
+def _iter_payloads(client: QdrantClient, collection: str) -> Iterator[dict]:
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection, limit=1000, offset=offset, with_payload=True, with_vectors=False
+        )
+        for p in points:
+            yield p.payload or {}
+        if offset is None:
+            break
+
+
+def _payloads(client: QdrantClient, collection: str, paths: list[str]) -> list[dict]:
+    points = client.retrieve(collection, ids=[point_id(p) for p in paths], with_payload=True)
+    return [pt.payload for pt in points if pt.payload]
+
+
+def open_store(cfg: Config) -> Store | ChunkStore:
+    if cfg.model.strategy == "chunks":
+        sustain = max(1, round(cfg.search.sustain_seconds / cfg.model.hop_seconds))
+        return ChunkStore(cfg.qdrant, sustain)
+    return Store(cfg.qdrant)
 
 
 class Store:
@@ -104,15 +157,10 @@ class Store:
             )
 
     def iter_payloads(self) -> Iterator[dict]:
-        offset = None
-        while True:
-            points, offset = self.client.scroll(
-                self.collection, limit=1000, offset=offset, with_payload=True, with_vectors=False
-            )
-            for p in points:
-                yield p.payload or {}
-            if offset is None:
-                break
+        return _iter_payloads(self.client, self.collection)
+
+    def payloads(self, paths: list[str]) -> list[dict]:
+        return _payloads(self.client, self.collection, paths)
 
     def search(self, vector: list[float], limit: int, share_weight: float = 0.0) -> list[Hit]:
         """MaxSim over each track's vectors. With share_weight > 0, candidates are re-ranked
@@ -138,4 +186,193 @@ class Store:
             hits.append(Hit(path=p.payload["path"], score=score, duration=p.payload.get("duration")))
         if rerank:
             hits.sort(key=lambda h: -h.score)
+        return hits[:limit]
+
+
+class ChunkStore:
+    """One point per window in `<collection>_chunks`, plus one per track in
+    `<collection>_tracks` holding the scan state and the track's mean vector. The track point
+    is written after its chunks, so a track whose chunks were only partly written has no
+    current track record and is redone on the next scan."""
+
+    def __init__(self, cfg: QdrantConfig, sustain_windows: int = 1):
+        self.cfg = cfg
+        self.sustain_windows = sustain_windows
+        self.collection = cfg.collection
+        self.tracks = f"{cfg.collection}_tracks"
+        self.chunks = f"{cfg.collection}_chunks"
+        self.client = QdrantClient(url=cfg.url, timeout=30)
+
+    def ensure(self, dim: int) -> None:
+        if self.client.collection_exists(self.tracks):
+            vectors = self.client.get_collection(self.tracks).config.params.vectors
+            if not isinstance(vectors, dict) or set(vectors) != set(TRACK_VECTORS):
+                log.warning("%r has an outdated layout; recreating the chunk index", self.tracks)
+                self.drop()
+        if not self.client.collection_exists(self.tracks):
+            self.client.create_collection(
+                self.tracks,
+                vectors_config={
+                    name: models.VectorParams(size=dim, distance=models.Distance.COSINE)
+                    for name in TRACK_VECTORS
+                },
+            )
+            self.client.create_payload_index(self.tracks, "path", models.PayloadSchemaType.KEYWORD)
+        if not self.client.collection_exists(self.chunks):
+            self.client.create_collection(
+                self.chunks,
+                vectors_config=models.VectorParams(
+                    size=dim, distance=models.Distance.COSINE, on_disk=True
+                ),
+                quantization_config=models.ScalarQuantization(
+                    scalar=models.ScalarQuantizationConfig(
+                        type=models.ScalarType.INT8, always_ram=True
+                    )
+                ),
+            )
+            self.client.create_payload_index(self.chunks, "path", models.PayloadSchemaType.KEYWORD)
+            self.client.create_payload_index(self.chunks, "silent", models.PayloadSchemaType.BOOL)
+
+    def drop(self) -> None:
+        for name in (self.chunks, self.tracks):
+            if self.client.collection_exists(name):
+                self.client.delete_collection(name)
+
+    def exists(self) -> bool:
+        return self.client.collection_exists(self.tracks)
+
+    def count(self) -> int:
+        if not self.exists():
+            return 0
+        return self.client.count(self.tracks, exact=True).count
+
+    def replace_track(
+        self,
+        path: str,
+        vectors: np.ndarray,
+        chunk_payloads: list[dict],
+        track_vectors: dict[str, list[float]],
+        track_payload: dict,
+    ) -> None:
+        """track_vectors holds TRACK_VECTORS entries; a missing direction is left out."""
+        self._delete_chunks([path])
+        points = [
+            models.PointStruct(id=chunk_id(path, i), vector=v.tolist(), payload=pl)
+            for i, (v, pl) in enumerate(zip(vectors, chunk_payloads, strict=True))
+        ]
+        for i in range(0, len(points), UPSERT_BATCH):
+            self.client.upsert(self.chunks, points=points[i : i + UPSERT_BATCH])
+        self.client.upsert(
+            self.tracks,
+            points=[
+                models.PointStruct(id=point_id(path), vector=track_vectors, payload=track_payload)
+            ],
+        )
+
+    def _delete_chunks(self, paths: list[str]) -> None:
+        self.client.delete(
+            self.chunks,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[models.FieldCondition(key="path", match=models.MatchAny(any=paths))]
+                )
+            ),
+        )
+
+    def delete_paths(self, paths: list[str]) -> None:
+        if paths:
+            self.client.delete(
+                self.tracks,
+                points_selector=models.PointIdsList(points=[point_id(p) for p in paths]),
+            )
+            self._delete_chunks(paths)
+
+    def iter_payloads(self) -> Iterator[dict]:
+        return _iter_payloads(self.client, self.tracks)
+
+    def payloads(self, paths: list[str]) -> list[dict]:
+        return _payloads(self.client, self.tracks, paths)
+
+    def track(self, path: str) -> tuple[dict, dict[str, np.ndarray]] | None:
+        points = self.client.retrieve(
+            self.tracks, ids=[point_id(path)], with_payload=True, with_vectors=True
+        )
+        if not points:
+            return None
+        vecs = {k: np.asarray(v, dtype=np.float32) for k, v in (points[0].vector or {}).items()}
+        return points[0].payload or {}, vecs
+
+    def intros_near(self, vector: np.ndarray, limit: int, exclude: list[str]) -> list[Candidate]:
+        """Audible tracks whose intro is closest to vector."""
+        res = self.client.query_points(
+            self.tracks,
+            query=vector.tolist(),
+            using="intro",
+            limit=limit,
+            query_filter=models.Filter(
+                must_not=[
+                    models.HasIdCondition(has_id=[point_id(p) for p in exclude]),
+                    models.FieldCondition(key="silent", match=models.MatchValue(value=True)),
+                ]
+            ),
+            with_payload=True,
+            with_vectors=["intro_dir", "mean"],
+        )
+        return [Candidate.of(p.payload or {}, p.score, p.vector or {}) for p in res.points]
+
+    def intros_of(self, vector: np.ndarray, paths: list[str]) -> list[Candidate]:
+        """Like intros_near, for the given tracks rather than the nearest ones."""
+        points = self.client.retrieve(
+            self.tracks,
+            ids=[point_id(p) for p in paths],
+            with_payload=True,
+            with_vectors=["intro", "intro_dir", "mean"],
+        )
+        return [
+            Candidate.of(
+                p.payload or {}, float(np.asarray(p.vector["intro"], np.float32) @ vector), p.vector
+            )
+            for p in points
+        ]
+
+    def sustained(self, vector: list[float], paths: list[str]) -> dict[str, float]:
+        """search()'s score for each of the given tracks; tracks with no loud windows are left out."""
+        if not paths:
+            return {}
+        only = models.FieldCondition(key="path", match=models.MatchAny(any=paths))
+        return {h.path: h.score for h in self._groups(vector, len(paths), only)}
+
+    def _groups(
+        self, vector: list[float], limit: int, only: models.FieldCondition | None = None
+    ) -> list[Hit]:
+        res = self.client.query_points_groups(
+            self.chunks,
+            group_by="path",
+            query=vector,
+            query_filter=models.Filter(
+                must=[only] if only else None,
+                must_not=[models.FieldCondition(key="silent", match=models.MatchValue(value=True))],
+            ),
+            limit=limit,
+            group_size=self.sustain_windows,
+            with_payload=["path", "start"],
+        )
+        return [
+            Hit(
+                path=g.hits[0].payload["path"],
+                score=float(np.mean([h.score for h in g.hits])),
+                duration=None,
+                start=g.hits[0].payload.get("start"),
+            )
+            for g in res.groups
+        ]
+
+    def search(self, vector: list[float], limit: int, share_weight: float = 0.0) -> list[Hit]:
+        """Tracks ranked by the mean similarity of their best sustain_windows non-silent
+        windows, so a track has to hold the vibe for a while rather than for one lucky
+        moment. Tracks with fewer windows are averaged over all of them. Candidates come from
+        each track's single best window, over-fetched to leave room for the re-rank.
+        share_weight doesn't apply."""
+        hits = self._groups(vector, limit * 3 if self.sustain_windows > 1 else limit)
+        hits.sort(key=lambda h: -h.score)
         return hits[:limit]

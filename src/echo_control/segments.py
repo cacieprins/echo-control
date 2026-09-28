@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import subprocess
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -94,6 +95,83 @@ def dense_chunks(
     if not keep:
         keep = [chunks[int(np.argmax(loudness))]]
     return keep, duration
+
+
+@dataclass
+class Windows:
+    """Overlapping fixed-length windows over one decoded track. The audio is held once as
+    int16 and windows are sliced from it on demand, so a long mix isn't copied per window."""
+
+    audio: np.ndarray
+    starts: list[int]
+    size: int
+    db: list[float]
+    silent: list[bool]
+
+    def __len__(self) -> int:
+        return len(self.starts)
+
+    def clip(self, i: int) -> np.ndarray:
+        s = self.starts[i]
+        return self.audio[s : s + self.size].astype(np.float32) / 32768.0
+
+    def span(self, i: int) -> tuple[float, float]:
+        s = self.starts[i]
+        return s / SAMPLE_RATE, min(s + self.size, len(self.audio)) / SAMPLE_RATE
+
+
+def window_starts(length: int, size: int, hop: int) -> list[int]:
+    """Start offsets of size-long windows every hop samples. A final shorter window covers
+    whatever audio the last full one missed; tracks shorter than one window get one."""
+    if length <= 0:
+        return []
+    if length <= size:
+        return [0]
+    starts = list(range(0, length - size + 1, hop))
+    if starts[-1] + size < length:
+        starts.append(starts[-1] + hop)
+    return starts
+
+
+def _to_int16(audio: np.ndarray) -> np.ndarray:
+    return (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+
+
+def _ffmpeg_s16(path: Path) -> np.ndarray:
+    proc = subprocess.Popen(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-ac", "1",
+         "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    assert proc.stdout is not None
+    blocks = []
+    try:
+        while buf := proc.stdout.read(1 << 22):
+            blocks.append(np.frombuffer(buf, dtype=np.int16))
+    finally:
+        proc.stdout.close()
+        proc.kill()
+        proc.wait()
+    return np.concatenate(blocks) if blocks else np.zeros(0, dtype=np.int16)
+
+
+def sliding_chunks(
+    path: Path, window_seconds: float, hop_seconds: float, silence_db: float
+) -> tuple[Windows, float]:
+    """Windows of window_seconds every hop_seconds across the whole track. Near-silent
+    windows are kept and flagged rather than dropped, so positions stay evenly spaced."""
+    audio = _ffmpeg_s16(path)
+    if not len(audio):
+        # ffmpeg rejects some files libsndfile reads (e.g. WAV data behind an ID3 header).
+        audio = _to_int16(_librosa_full(path))
+    size = int(window_seconds * SAMPLE_RATE)
+    starts = window_starts(len(audio), size, int(hop_seconds * SAMPLE_RATE))
+    win = Windows(audio, starts, size, [], [])
+    win.db = [_db(win.clip(i)) for i in range(len(starts))]
+    win.silent = [d < silence_db for d in win.db]
+    return win, len(audio) / SAMPLE_RATE
 
 
 def _normalize(v: np.ndarray) -> np.ndarray:

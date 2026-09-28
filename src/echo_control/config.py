@@ -54,11 +54,24 @@ class ModelConfig:
     merge_threshold: float = 0.85
     max_chunks: int = 60
     silence_db: float = -45.0
+    hop_seconds: float = 2.5
+    edge_seconds: float = 30.0
 
 
 @dataclass
 class SearchConfig:
     share_weight: float = 0.0
+    sustain_seconds: float = 60.0
+
+
+@dataclass
+class WanderConfig:
+    position: float = 1.0
+    direction: float = 0.5
+    drift: float = 0.25
+    candidates: int = 100
+    duplicate_similarity: float = 0.99
+    duplicate_seconds: float = 3.0
 
 
 @dataclass
@@ -84,6 +97,7 @@ class Config:
     qdrant: QdrantConfig = field(default_factory=QdrantConfig)
     player: PlayerConfig = field(default_factory=PlayerConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
+    wander: WanderConfig = field(default_factory=WanderConfig)
     path: Path | None = None
 
 
@@ -113,8 +127,12 @@ def load(path: Path | None = None) -> Config:
     library.exclude.append(player.spotatui_dir.expanduser().resolve())
 
     model = ModelConfig(**raw.get("model", {}))
-    if model.strategy not in ("mean", "clusters"):
-        raise ValueError(f"[model] strategy must be 'mean' or 'clusters', not {model.strategy!r}")
+    if model.strategy not in ("mean", "clusters", "chunks"):
+        raise ValueError(
+            f"[model] strategy must be 'mean', 'clusters' or 'chunks', not {model.strategy!r}"
+        )
+    if not 0 < model.hop_seconds <= model.window_seconds:
+        raise ValueError("[model] hop_seconds must be > 0 and <= window_seconds")
 
     return Config(
         library=library,
@@ -122,5 +140,6 @@ def load(path: Path | None = None) -> Config:
         qdrant=QdrantConfig(**raw.get("qdrant", {})),
         player=player,
         search=SearchConfig(**raw.get("search", {})),
+        wander=WanderConfig(**raw.get("wander", {})),
         path=path if path.exists() else None,
     )

@@ -15,7 +15,7 @@ from watchdog.observers import Observer
 from .clap import load_encoders
 from .config import Config, socket_path
 from .indexer import Indexer, is_audio
-from .store import Store, point_id, wait_ready
+from .store import open_store, wait_ready
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ class Daemon:
         wait_ready(cfg.qdrant.url, cfg.qdrant.ready_timeout)
         self.encoders = load_encoders(cfg.model)
         self.clap = self.encoders[0]
-        self.store = Store(cfg.qdrant)
+        self.store = open_store(cfg)
         self.indexer = Indexer(cfg, self.encoders, self.store)
 
     def touch(self, path: Path) -> None:
@@ -96,10 +96,8 @@ class Daemon:
                     log.info("removed %s", p)
 
     def _known(self, paths: list[Path]) -> dict:
-        points = self.store.client.retrieve(
-            self.store.collection, ids=[point_id(str(p)) for p in paths], with_payload=True
-        )
-        return {pt.payload["path"]: self.indexer.state_key(pt.payload) for pt in points if pt.payload}
+        payloads = self.store.payloads([str(p) for p in paths])
+        return {pl["path"]: self.indexer.state_key(pl) for pl in payloads}
 
     def handle(self, req: dict) -> dict:
         op = req.get("op")
