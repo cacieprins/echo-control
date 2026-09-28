@@ -5,7 +5,7 @@ Search a local music library by vibe. A daemon embeds every track with
 Qdrant; `vibe` embeds a text prompt and plays the closest matches.
 
 ```bash
-vibe "angsty lesbian music from the late 20th century"
+vibe "teen angst"
 vibe "sad synth" -n 40 | mpv --playlist=-
 ```
 
@@ -40,7 +40,10 @@ The first scan is slow on CPU; watch it with `journalctl --user -fu echo-control
   stays running and keeps 3 tracks queued past the current one over mpv's IPC socket,
   extending the walk as you listen. Quit mpv to stop. With `--detach`, the feeding runs in
   the background. `-n` doesn't apply.
-- `echo-control daemon` runs the indexer/watcher and the text-embedding socket.
+- `echo-control daemon` runs the watcher and the text-embedding socket. Queries are embedded
+  on the CPU; scans and changed files are indexed in a short-lived child process that loads
+  the GPU encoders and exits (ROCm keeps a CPU core busy for as long as a process has used
+  the GPU).
 - `echo-control scan` runs a one-off index pass without the daemon.
 - `echo-control reindex` drops the current strategy's index and rebuilds it.
 - `echo-control status` shows daemon, Qdrant and index state.
@@ -104,10 +107,12 @@ center are considered too, so the walk can return even after every nearby intro 
 drifted away.
 
 Walks never pick a track with no audible windows, or another file of a track already in
-the walk. A duplicate is one whose `mean` vector is at least `duplicate_similarity` (0.99)
-similar and whose duration is within `duplicate_seconds` (3) of it. Lowering the
-similarity to about 0.975 also catches remasters and compilation copies, but starts to
-catch similar same-length tracks from the same album.
+the walk. When a candidate's `mean` or `intro` is at least `duplicate_similarity` (0.95)
+similar to a played track's, their windows are compared in time order, allowing up to
+20s of offset, over the stretch both files cover. At least `duplicate_alignment` (0.92)
+counts as the same recording. Other encodes, remasters, compilation versions and
+truncated files line up window for window, at about 0.94–1.0. Tracks from one album that
+only sound alike on average come out at about 0.86–0.87.
 
 ## Noctalia
 

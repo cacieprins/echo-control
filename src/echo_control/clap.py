@@ -85,8 +85,63 @@ def resolve_devices(setting: str) -> list[str]:
 
 
 def load_encoders(cfg: ModelConfig) -> list[Clap]:
-    """One model replica per device; the first also serves text queries."""
+    """One model replica per device."""
     return [Clap(cfg, device) for device in resolve_devices(cfg.device)]
+
+
+def signature(c: ModelConfig) -> str:
+    """Identifies the embedding settings; tracks indexed under another one get redone."""
+    if c.strategy == "mean":
+        return f"{c.name}|mean|{c.windows}x{c.window_seconds:g}"
+    if c.strategy == "chunks":
+        return (
+            f"{c.name}|chunks|{c.window_seconds:g}|{c.hop_seconds:g}|{c.silence_db:g}"
+            f"|{c.edge_seconds:g}"
+        )
+    return (
+        f"{c.name}|clusters|{c.window_seconds:g}|{c.max_chunks}|{c.silence_db:g}"
+        f"|{c.max_clusters}|{c.min_cluster_share:g}|{c.merge_threshold:g}"
+    )
+
+
+def prompt(cfg: ModelConfig, text: str) -> str:
+    # CLAP's tokenizer is case-sensitive and "a recording of" embeds far from
+    # "A recording of", so a user-typed prefix is replaced with the configured one.
+    prefix = cfg.text_prefix
+    text = text.strip()
+    if not prefix:
+        return text
+    head = prefix.strip()
+    if text.lower().startswith(head.lower()):
+        text = text[len(head) :].lstrip()
+    return prefix + text
+
+
+class TextEncoder:
+    """CLAP's text tower alone, on the CPU. Touching the GPU starts a ROCm runtime
+    thread that busy-spins for the life of the process, so query serving stays off it."""
+
+    def __init__(self, cfg: ModelConfig):
+        import torch
+        import transformers
+        from transformers import ClapProcessor, ClapTextModelWithProjection
+
+        self.cfg = cfg
+        self.torch = torch
+        verbosity = transformers.logging.get_verbosity()
+        transformers.logging.set_verbosity_error()  # the unused audio weights get a report
+        try:
+            self.processor = ClapProcessor.from_pretrained(cfg.name)
+            self.model = ClapTextModelWithProjection.from_pretrained(cfg.name).eval()
+        finally:
+            transformers.logging.set_verbosity(verbosity)
+        self.dim = int(self.model.config.projection_dim)
+
+    def embed_text(self, text: str) -> list[float]:
+        inputs = self.processor(text=[prompt(self.cfg, text)], return_tensors="pt", padding=True)
+        with self.torch.inference_mode():
+            emb = self.model(**inputs).text_embeds
+        return Clap._normalize(emb.float().numpy())[0].tolist()
 
 
 class Clap:
@@ -114,26 +169,6 @@ class Clap:
     @staticmethod
     def _normalize(v: np.ndarray) -> np.ndarray:
         return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-12)
-
-    def prompt(self, text: str) -> str:
-        # CLAP's tokenizer is case-sensitive and "a recording of" embeds far from
-        # "A recording of", so a user-typed prefix is replaced with the configured one.
-        prefix = self.cfg.text_prefix
-        text = text.strip()
-        if not prefix:
-            return text
-        head = prefix.strip()
-        if text.lower().startswith(head.lower()):
-            text = text[len(head) :].lstrip()
-        return prefix + text
-
-    def embed_text(self, text: str) -> list[float]:
-        inputs = self.processor(
-            text=[self.prompt(text)], return_tensors="pt", padding=True
-        ).to(self.device)
-        with self.torch.inference_mode():
-            emb = self.model.get_text_features(**inputs)
-        return self._normalize(self._features(emb))[0].tolist()
 
     def _gpu_features_supported(self) -> bool:
         fe = self.processor.feature_extractor
@@ -196,19 +231,7 @@ class Clap:
 
     @property
     def signature(self) -> str:
-        """Identifies the embedding settings; tracks indexed under another one get redone."""
-        c = self.cfg
-        if c.strategy == "mean":
-            return f"{c.name}|mean|{c.windows}x{c.window_seconds:g}"
-        if c.strategy == "chunks":
-            return (
-                f"{c.name}|chunks|{c.window_seconds:g}|{c.hop_seconds:g}|{c.silence_db:g}"
-                f"|{c.edge_seconds:g}"
-            )
-        return (
-            f"{c.name}|clusters|{c.window_seconds:g}|{c.max_chunks}|{c.silence_db:g}"
-            f"|{c.max_clusters}|{c.min_cluster_share:g}|{c.merge_threshold:g}"
-        )
+        return signature(self.cfg)
 
     def decode(self, path: Path) -> tuple[list[np.ndarray] | Windows, float]:
         c = self.cfg

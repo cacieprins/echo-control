@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing
 import os
 import signal
 import socketserver
@@ -12,12 +13,40 @@ from pathlib import Path
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from .clap import load_encoders
+from .clap import TextEncoder, signature
 from .config import Config, socket_path
-from .indexer import Indexer, is_audio
+from .indexer import current_key, is_audio, state_key
 from .store import open_store, wait_ready
 
 log = logging.getLogger(__name__)
+
+
+def _index_job(cfg: Config, paths: list[str] | None, stop, conn) -> None:
+    """Runs in a spawned child: loads the GPU encoders, indexes, and exits, which is the
+    only way to get rid of ROCm's spinning runtime thread once the GPU has been used."""
+    from .cli import _setup_logging
+    from .clap import load_encoders
+    from .indexer import Indexer
+
+    _setup_logging()
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    code = 0
+    try:
+        indexer = Indexer(cfg, load_encoders(cfg.model), open_store(cfg))
+        if paths is None:
+            conn.send(indexer.scan(stop))
+        else:
+            conn.send(indexer.index_many([Path(p) for p in paths], stop))
+    except BaseException:
+        log.exception("indexing failed")
+        code = 1
+    finally:
+        conn.close()
+        logging.shutdown()
+        # Interpreter teardown aborts inside ROCm/OpenBLAS worker threads (SIGABRT core
+        # dump); every upsert is already committed, so skip it.
+        os._exit(code)
 
 DEBOUNCE_SECONDS = 5.0
 # Reads (including our own while embedding) emit "opened" and "closed_no_write"; ignore them.
@@ -47,13 +76,41 @@ class Daemon:
         self.scan_now = threading.Event()
         self.pending: dict[Path, float] = {}
         self.pending_lock = threading.Lock()
-        self.state = {"started": time.time(), "scanning": False, "last_scan": None}
+        self.state = {"started": time.time(), "scanning": False, "indexing": False, "last_scan": None}
+        self.job_lock = threading.Lock()
+        self.signature = signature(cfg.model)
 
         wait_ready(cfg.qdrant.url, cfg.qdrant.ready_timeout)
-        self.encoders = load_encoders(cfg.model)
-        self.clap = self.encoders[0]
+        self.text = TextEncoder(cfg.model)
         self.store = open_store(cfg)
-        self.indexer = Indexer(cfg, self.encoders, self.store)
+        self.store.ensure(self.text.dim)
+
+    def _run_job(self, paths: list[Path] | None):
+        """Index in a child process (a full scan when paths is None) and return its result,
+        or None if it failed. Jobs run one at a time."""
+        ctx = multiprocessing.get_context("spawn")
+        with self.job_lock:
+            if self.stop.is_set():
+                return None
+            recv, send = ctx.Pipe(duplex=False)
+            stop = ctx.Event()
+            args = (self.cfg, None if paths is None else [str(p) for p in paths], stop, send)
+            proc = ctx.Process(target=_index_job, args=args, name="echo-control-index")
+            self.state["indexing"] = True
+            try:
+                proc.start()
+                send.close()
+                while proc.is_alive():
+                    if self.stop.is_set():
+                        stop.set()
+                    proc.join(1.0)
+                result = recv.recv() if recv.poll() else None
+            finally:
+                recv.close()
+                self.state["indexing"] = False
+            if proc.exitcode != 0:
+                log.error("indexing process exited with %s", proc.exitcode)
+            return result
 
     def touch(self, path: Path) -> None:
         if is_audio(path, self.cfg):
@@ -67,14 +124,14 @@ class Daemon:
         while not self.stop.is_set():
             self.state["scanning"] = True
             try:
-                total, added, removed = self.indexer.scan(self.stop)
+                result = self._run_job(None)
+            finally:
+                self.state["scanning"] = False
+            if result is not None:
+                total, added, removed = result
                 self.state["last_scan"] = {
                     "at": time.time(), "files": total, "indexed": added, "removed": removed
                 }
-            except Exception:
-                log.exception("scan failed")
-            finally:
-                self.state["scanning"] = False
             self.scan_now.wait(self.cfg.library.rescan_interval)
             self.scan_now.clear()
 
@@ -85,31 +142,38 @@ class Daemon:
                 ready = [p for p, t in self.pending.items() if now - t >= DEBOUNCE_SECONDS]
                 for p in ready:
                     del self.pending[p]
-            if ready:
-                known = self._known(ready)
-            for p in ready:
-                if p.exists():
-                    if self.indexer.index_file(p, known):
-                        log.info("indexed %s", p)
-                else:
-                    self.indexer.remove([p])
+            if not ready:
+                continue
+            gone = [p for p in ready if not p.exists()]
+            if gone:
+                self.store.delete_paths([str(p) for p in gone])
+                for p in gone:
                     log.info("removed %s", p)
+            known = self._known(ready)
+            changed = [
+                p for p in ready
+                if p.exists() and known.get(str(p)) != current_key(p, self.signature)
+            ]
+            if changed:
+                added = self._run_job(changed)
+                if added is not None:
+                    log.info("indexed %d of %d changed files", added, len(changed))
 
     def _known(self, paths: list[Path]) -> dict:
         payloads = self.store.payloads([str(p) for p in paths])
-        return {pl["path"]: self.indexer.state_key(pl) for pl in payloads}
+        return {pl["path"]: state_key(pl) for pl in payloads}
 
     def handle(self, req: dict) -> dict:
         op = req.get("op")
         if op == "embed":
-            return {"vector": self.clap.embed_text(str(req["text"]))}
+            return {"vector": self.text.embed_text(str(req["text"]))}
         if op == "status":
             with self.pending_lock:
                 pending = len(self.pending)
             return {
                 **self.state,
                 "pending": pending,
-                "device": ", ".join(e.device for e in self.encoders),
+                "device": self.cfg.model.device,
                 "model": self.cfg.model.name,
                 "strategy": self.cfg.model.strategy,
                 "indexed": self.store.count(),
@@ -167,7 +231,8 @@ class Daemon:
         server.server_close()
         sock.unlink(missing_ok=True)
         observer.join(timeout=5)
-        threads[0].join(timeout=30)
+        for t in threads[:2]:
+            t.join(timeout=30)
         logging.shutdown()
         # Normal interpreter teardown aborts inside ROCm/OpenBLAS worker threads (SIGABRT
         # core dump); every upsert is already committed, so skip it.

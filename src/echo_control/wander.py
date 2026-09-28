@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import trajectory
 from .config import WanderConfig
 from .store import Candidate, ChunkStore
 
@@ -27,7 +28,7 @@ class Transition:
     drift: float
     center: float = 0.0
     mean: np.ndarray | None = field(default=None, repr=False)
-    duration: float = 0.0
+    intro: np.ndarray | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -41,15 +42,36 @@ def drift_match(a: float, b: float) -> float:
     return -abs(math.log((a + DRIFT_EPS) / (b + DRIFT_EPS)))
 
 
-def is_duplicate(cand: Candidate, played: list[Transition], cfg: WanderConfig) -> bool:
-    """Another file of a track already played: near-identical overall sound and length.
-    Similar tracks from one album can sound as alike, but rarely run the same length."""
-    duration = float(cand.payload.get("duration") or 0.0)
-    return any(
-        float(cand.mean @ t.mean) >= cfg.duplicate_similarity
-        and abs(duration - t.duration) <= cfg.duplicate_seconds
-        for t in played
-    )
+class Duplicates:
+    """Spots another file of a track already played. Pairs that are close overall or at
+    the intro get their windows compared in time order over the stretch they share:
+    copies of one recording (other encodes, remasters, compilation versions, truncated
+    files) line up window for window, while similar tracks from one album only match on
+    average. Window vectors are fetched once per track and cached for the walk."""
+
+    def __init__(self, store: ChunkStore, cfg: WanderConfig):
+        self.store = store
+        self.cfg = cfg
+        self.windows: dict[str, np.ndarray] = {}
+
+    def _windows(self, path: str) -> np.ndarray:
+        if path not in self.windows:
+            self.windows[path] = self.store.chunk_vectors(path)
+        return self.windows[path]
+
+    def __call__(self, cand: Candidate, played: list[Transition]) -> bool:
+        cfg = self.cfg
+        path = cand.payload["path"]
+        for t in played:
+            close = float(cand.mean @ t.mean) >= cfg.duplicate_similarity or (
+                t.intro is not None and float(cand.intro @ t.intro) >= cfg.duplicate_similarity
+            )
+            if close and (
+                trajectory.aligned_similarity(self._windows(path), self._windows(t.path))
+                >= cfg.duplicate_alignment
+            ):
+                return True
+        return False
 
 
 def rank_next(
@@ -57,11 +79,13 @@ def rank_next(
     played: list[Transition],
     cfg: WanderConfig,
     orbit: Orbit | None = None,
+    duplicates: Duplicates | None = None,
 ) -> list[Transition]:
     """Candidate follow-ups to the last played track, best first, leaving out anything
     played already or a duplicate of it. When orbiting, the tracks closest to the center
     are candidates too, so the walk can come back even if every intro near the current
     outro has drifted away."""
+    duplicates = duplicates or Duplicates(store, cfg)
     path = played[-1].path
     found = store.track(path)
     if found is None:
@@ -80,7 +104,7 @@ def rank_next(
 
     out = []
     for c in cands:
-        if is_duplicate(c, played, cfg):
+        if duplicates(c, played):
             continue
         direction = (
             float(outro_dir @ c.intro_dir)
@@ -93,8 +117,7 @@ def rank_next(
         if orbit:
             score += orbit.strength * center
         out.append(Transition(
-            c.payload["path"], score, c.position, direction, drift, center,
-            c.mean, float(c.payload.get("duration") or 0.0),
+            c.payload["path"], score, c.position, direction, drift, center, c.mean, c.intro,
         ))
     out.sort(key=lambda t: -t.score)
     return out
@@ -108,12 +131,11 @@ def walk(
     found = store.track(seed)
     if found is None:
         raise KeyError(seed)
-    payload, vecs = found
-    chain = [Transition(
-        seed, 0.0, 0.0, 0.0, 0.0, mean=vecs["mean"], duration=float(payload.get("duration") or 0.0)
-    )]
+    _, vecs = found
+    chain = [Transition(seed, 0.0, 0.0, 0.0, 0.0, mean=vecs["mean"], intro=vecs["intro"])]
     yield chain[0]
-    while ranked := rank_next(store, chain, cfg, orbit):
+    duplicates = Duplicates(store, cfg)
+    while ranked := rank_next(store, chain, cfg, orbit, duplicates):
         chain.append(ranked[0])
         yield ranked[0]
 

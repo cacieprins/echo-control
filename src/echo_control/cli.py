@@ -35,10 +35,10 @@ def _embed_text(cfg: config_mod.Config, text: str) -> list[float]:
     resp = request({"op": "embed", "text": text})
     if resp is not None:
         return resp["vector"]
-    print("daemon not running; loading CLAP locally (slow)...", file=sys.stderr)
-    from .clap import Clap
+    print("daemon not running; loading CLAP locally...", file=sys.stderr)
+    from .clap import TextEncoder
 
-    return Clap(cfg.model).embed_text(text)
+    return TextEncoder(cfg.model).embed_text(text)
 
 
 def _relative_dir(path: Path, roots: list[Path]) -> str:
@@ -260,6 +260,8 @@ def cmd_status(cfg: config_mod.Config, _args) -> None:
     scan = st.get("last_scan")
     if st["scanning"]:
         print("scan:    in progress (journalctl --user -fu echo-control)")
+    elif st.get("indexing"):
+        print("scan:    indexing changed files")
     elif scan:
         print(f"scan:    last found {scan['files']} files, indexed {scan['indexed']}, removed {scan['removed']}")
     if st["pending"]:

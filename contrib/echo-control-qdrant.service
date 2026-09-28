@@ -1,5 +1,7 @@
 [Unit]
 Description=Qdrant vector database for echo-control (docker)
+# $HOME is shared with distrobox/toolbox containers, whose systemd would run this too.
+ConditionVirtualization=!container
 
 [Service]
 Type=simple

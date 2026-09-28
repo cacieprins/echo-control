@@ -51,6 +51,18 @@ def is_audio(path: Path, cfg: Config) -> bool:
     )
 
 
+def state_key(payload: dict) -> Key:
+    return (payload.get("mtime"), payload.get("size"), payload.get("embedding"))
+
+
+def current_key(path: Path, signature: str) -> Key | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime, st.st_size, signature)
+
+
 class Indexer:
     def __init__(self, cfg: Config, encoders: list[Clap], store: Store | ChunkStore):
         self.cfg = cfg
@@ -59,15 +71,8 @@ class Indexer:
         self.store = store
         store.ensure(self.clap.dim)
 
-    def state_key(self, payload: dict) -> Key:
-        return (payload.get("mtime"), payload.get("size"), payload.get("embedding"))
-
     def current_key(self, path: Path) -> Key | None:
-        try:
-            st = path.stat()
-        except OSError:
-            return None
-        return (st.st_mtime, st.st_size, self.clap.signature)
+        return current_key(path, self.clap.signature)
 
     def index_file(
         self,
@@ -168,13 +173,13 @@ class Indexer:
 
     def scan(self, stop: threading.Event | None = None) -> tuple[int, int, int]:
         """Full pass: index new/changed files, prune missing ones."""
-        known = {p["path"]: self.state_key(p) for p in self.store.iter_payloads() if "path" in p}
+        known = {p["path"]: state_key(p) for p in self.store.iter_payloads() if "path" in p}
         lib = self.cfg.library
         files = list(iter_audio_files(lib.paths, lib.extensions, lib.exclude))
         todo = [f for f in files if known.get(str(f)) != self.current_key(f)]
         log.info("scan: %d files, %d new or changed", len(files), len(todo))
 
-        added = self._index_many(todo, stop)
+        added = self.index_many(todo, stop)
 
         present = {str(f) for f in files}
         missing = [p for p in known if p not in present]
@@ -183,7 +188,7 @@ class Indexer:
             log.info("pruned %d missing files", len(missing))
         return len(files), added, len(missing)
 
-    def _index_many(self, todo: list[Path], stop: threading.Event | None) -> int:
+    def index_many(self, todo: list[Path], stop: threading.Event | None = None) -> int:
         """Decode on a thread pool and embed on one worker thread per encoder (GPU)."""
         workers = len(self.encoders)
         work: queue.Queue[tuple[Path, Future] | None] = queue.Queue(maxsize=workers * 4)

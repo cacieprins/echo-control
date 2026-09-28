@@ -93,6 +93,19 @@ def summarize(
     }
 
 
+def aligned_similarity(a: np.ndarray, b: np.ndarray, max_shift: int = 8) -> float:
+    """Mean window-by-window similarity of two tracks at their best time offset (up to
+    max_shift windows either way, for different lead-ins). Two files of one recording line
+    up almost exactly; tracks that merely sound alike on average don't."""
+    best = -1.0
+    for k in range(-max_shift, max_shift + 1):
+        x, y = (a[k:], b) if k >= 0 else (a, b[-k:])
+        n = min(len(x), len(y))
+        if n >= min(4, len(a), len(b)) and n > 0:
+            best = max(best, float(np.einsum("ij,ij->i", x[:n], y[:n]).mean()))
+    return best
+
+
 @dataclass
 class Edge:
     """Where a track sits and where it's heading over its first or last stretch."""

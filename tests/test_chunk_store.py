@@ -52,18 +52,17 @@ def test_wander_skips_duplicates_and_silent_tracks(store):
     from echo_control.wander import wander
 
     eye = np.eye(8, dtype=np.float32)
-    _put(store, "/a", eye[[4]], intro=eye[0].tolist(), outro=eye[1].tolist(),
-         payload={"duration": 200.0})
-    # Continue /a perfectly, but: another file of /a, and a silent track.
-    _put(store, "/a (1)", eye[[4]], intro=eye[1].tolist(), outro=eye[1].tolist(),
-         payload={"duration": 201.0})
-    _put(store, "/quiet", eye[[6]], intro=eye[1].tolist(), outro=eye[1].tolist(),
-         payload={"duration": 60.0, "silent": True})
-    # Sounds the same as /a overall but runs a different length: not a duplicate.
-    _put(store, "/same-album", eye[[4]], intro=(0.9 * eye[1] + 0.44 * eye[2]).tolist(),
-         outro=eye[2].tolist(), payload={"duration": 150.0})
-    _put(store, "/b", eye[[5]], intro=eye[2].tolist(), outro=eye[3].tolist(),
-         payload={"duration": 100.0})
+    song = eye[[2, 3, 4, 5, 6, 7]]
+    e1 = eye[1].tolist()
+    _put(store, "/a", song, intro=e1, outro=e1)
+    # Each of these continues /a perfectly, but is another file of it or silent.
+    _put(store, "/a (1)", song, intro=e1, outro=e1)
+    _put(store, "/a (partial)", song[:3], intro=e1, outro=e1)
+    _put(store, "/quiet", eye[[0]], intro=e1, outro=e1, payload={"silent": True})
+    # The same windows in another order: identical on average, but not the same recording.
+    _put(store, "/same-album", song[::-1], intro=(0.9 * eye[1] + 0.44 * eye[2]).tolist(),
+         outro=eye[2].tolist())
+    _put(store, "/b", eye[[0, 1]], intro=eye[2].tolist(), outro=eye[3].tolist())
     chain = wander(store, "/a", 3, WanderConfig())
     assert [t.path for t in chain] == ["/a", "/same-album", "/b"]
 

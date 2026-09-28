@@ -55,11 +55,13 @@ direction = 0.5
 drift = 0.25
 candidates = 100          # nearest intros considered at each step (and, for --orbit,
                           # tracks nearest the center); --orbit=N adds N * center similarity
-# Never pick another file of a track already in the walk: overall sound at least this
-# similar and duration within this many seconds. ~0.975 also catches remasters and
-# compilation copies, but starts to catch similar same-length tracks from the same album.
-duplicate_similarity = 0.99
-duplicate_seconds = 3.0
+# Never pick another file of a track already in the walk. Pairs at least
+# duplicate_similarity alike overall or at the intro get their windows compared in time
+# order over the stretch they share; at least duplicate_alignment means the same recording.
+# Copies (other encodes, remasters, compilation versions, truncated files) line up at
+# ~0.94-1.0, similar tracks from one album at ~0.86-0.87.
+duplicate_similarity = 0.95
+duplicate_alignment = 0.92
 
 [player]
 backend = "mpv"        # mpv | spotatui | command | stdout

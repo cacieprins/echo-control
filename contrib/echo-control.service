@@ -1,5 +1,7 @@
 [Unit]
 Description=echo-control CLAP music indexer
+# $HOME is shared with distrobox/toolbox containers, whose systemd would run this too.
+ConditionVirtualization=!container
 Requires=echo-control-qdrant.service
 After=echo-control-qdrant.service
 

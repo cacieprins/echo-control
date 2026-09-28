@@ -77,6 +77,19 @@ def test_edges_of_a_single_window():
     assert np.allclose(intro.position, v[0])
 
 
+def test_aligned_similarity_finds_offset_copies_and_prefixes():
+    vecs, _ = _track(4, 10, noise=0.05)
+    assert trajectory.aligned_similarity(vecs, vecs) > 0.999
+    # Same recording with 5 extra windows of lead-in, and a truncated copy.
+    rng = np.random.default_rng(3)
+    lead_in = _unit(rng.normal(size=(5, vecs.shape[1])))
+    assert trajectory.aligned_similarity(np.concatenate([lead_in, vecs]), vecs) > 0.999
+    assert trajectory.aligned_similarity(vecs[:12], vecs) > 0.999
+    # The same windows shuffled: same average, but they don't line up.
+    shuffled = vecs[rng.permutation(len(vecs))]
+    assert trajectory.aligned_similarity(shuffled, vecs) < 0.6
+
+
 def test_wandering_path_is_more_tortuous_than_a_straight_one():
     straight = _unit(np.stack([np.cos(np.linspace(0, 1, 50)), np.sin(np.linspace(0, 1, 50))], 1))
     starts = np.arange(50) * 2.5

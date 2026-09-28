@@ -50,6 +50,7 @@ class Candidate:
     position: float
     intro_dir: np.ndarray | None
     mean: np.ndarray
+    intro: np.ndarray
 
     @classmethod
     def of(cls, payload: dict, position: float, vectors: dict) -> Candidate:
@@ -59,6 +60,7 @@ class Candidate:
             position,
             None if d is None else np.asarray(d, np.float32),
             np.asarray(vectors["mean"], np.float32),
+            np.asarray(vectors["intro"], np.float32),
         )
 
 
@@ -302,6 +304,20 @@ class ChunkStore:
         vecs = {k: np.asarray(v, dtype=np.float32) for k, v in (points[0].vector or {}).items()}
         return points[0].payload or {}, vecs
 
+    def chunk_vectors(self, path: str) -> np.ndarray:
+        """The track's window vectors in time order."""
+        points, _ = self.client.scroll(
+            self.chunks,
+            scroll_filter=models.Filter(
+                must=[models.FieldCondition(key="path", match=models.MatchValue(value=path))]
+            ),
+            limit=1_000_000,
+            with_payload=["idx"],
+            with_vectors=True,
+        )
+        points.sort(key=lambda p: p.payload["idx"])
+        return np.array([p.vector for p in points], dtype=np.float32)
+
     def intros_near(self, vector: np.ndarray, limit: int, exclude: list[str]) -> list[Candidate]:
         """Audible tracks whose intro is closest to vector."""
         res = self.client.query_points(
@@ -316,7 +332,7 @@ class ChunkStore:
                 ]
             ),
             with_payload=True,
-            with_vectors=["intro_dir", "mean"],
+            with_vectors=["intro", "intro_dir", "mean"],
         )
         return [Candidate.of(p.payload or {}, p.score, p.vector or {}) for p in res.points]
 

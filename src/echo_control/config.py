@@ -70,8 +70,8 @@ class WanderConfig:
     direction: float = 0.5
     drift: float = 0.25
     candidates: int = 100
-    duplicate_similarity: float = 0.99
-    duplicate_seconds: float = 3.0
+    duplicate_similarity: float = 0.95
+    duplicate_alignment: float = 0.92
 
 
 @dataclass
