@@ -6,31 +6,50 @@ import multiprocessing
 import os
 import signal
 import socketserver
+import sys
 import threading
 import time
+from multiprocessing.connection import Connection
+from multiprocessing.synchronize import Event
 from pathlib import Path
+from types import FrameType
+from typing import Any, override
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .clap import TextEncoder, signature
 from .config import Config, socket_path
-from .indexer import current_key, is_audio, state_key
-from .store import open_store, wait_ready
+from .indexer import Key, current_key, is_audio, state_key
+from .store import ChunkStore, Store, open_store, wait_ready
 
 log = logging.getLogger(__name__)
 
 
-def _index_job(cfg: Config, paths: list[str] | None, stop, conn) -> None:
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+    for noisy in ("httpx", "urllib3", "numba", "watchdog"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def _index_job(
+    cfg: Config,
+    paths: list[str] | None,
+    stop: Event,
+    conn: Connection[tuple[int, int, int] | int, object],
+) -> None:
     """Runs in a spawned child: loads the GPU encoders, indexes, and exits, which is the
     only way to get rid of ROCm's spinning runtime thread once the GPU has been used."""
-    from .cli import _setup_logging
     from .clap import load_encoders
     from .indexer import Indexer
 
-    _setup_logging()
+    setup_logging()
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGTERM, lambda _signum, _frame: stop.set())
     code = 0
     try:
         indexer = Indexer(cfg, load_encoders(cfg.model), open_store(cfg))
@@ -55,8 +74,9 @@ CHANGE_EVENTS = {"created", "modified", "moved", "deleted", "closed"}
 
 class _Handler(FileSystemEventHandler):
     def __init__(self, daemon: Daemon):
-        self.daemon = daemon
+        self.daemon: Daemon = daemon
 
+    @override
     def on_any_event(self, event: FileSystemEvent) -> None:
         if event.event_type not in CHANGE_EVENTS:
             return
@@ -71,21 +91,21 @@ class _Handler(FileSystemEventHandler):
 
 class Daemon:
     def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.stop = threading.Event()
-        self.scan_now = threading.Event()
+        self.cfg: Config = cfg
+        self.stop: threading.Event = threading.Event()
+        self.scan_now: threading.Event = threading.Event()
         self.pending: dict[Path, float] = {}
-        self.pending_lock = threading.Lock()
-        self.state = {"started": time.time(), "scanning": False, "indexing": False, "last_scan": None}
-        self.job_lock = threading.Lock()
-        self.signature = signature(cfg.model)
+        self.pending_lock: threading.Lock = threading.Lock()
+        self.state: dict[str, Any] = {"started": time.time(), "scanning": False, "indexing": False, "last_scan": None}
+        self.job_lock: threading.Lock = threading.Lock()
+        self.signature: str = signature(cfg.model)
 
         wait_ready(cfg.qdrant.url, cfg.qdrant.ready_timeout)
-        self.text = TextEncoder(cfg.model)
-        self.store = open_store(cfg)
+        self.text: TextEncoder = TextEncoder(cfg.model)
+        self.store: Store | ChunkStore = open_store(cfg)
         self.store.ensure(self.text.dim)
 
-    def _run_job(self, paths: list[Path] | None):
+    def _run_job(self, paths: list[Path] | None) -> Any:
         """Index in a child process (a full scan when paths is None) and return its result,
         or None if it failed. Jobs run one at a time."""
         ctx = multiprocessing.get_context("spawn")
@@ -159,11 +179,11 @@ class Daemon:
                 if added is not None:
                     log.info("indexed %d of %d changed files", added, len(changed))
 
-    def _known(self, paths: list[Path]) -> dict:
+    def _known(self, paths: list[Path]) -> dict[str, Key]:
         payloads = self.store.payloads([str(p) for p in paths])
         return {pl["path"]: state_key(pl) for pl in payloads}
 
-    def handle(self, req: dict) -> dict:
+    def handle(self, req: dict[str, Any]) -> dict[str, Any]:
         op = req.get("op")
         if op == "embed":
             return {"vector": self.text.embed_text(str(req["text"]))}
@@ -186,6 +206,7 @@ class Daemon:
         daemon = self
 
         class RequestHandler(socketserver.StreamRequestHandler):
+            @override
             def handle(self) -> None:
                 line = self.rfile.readline()
                 try:
@@ -196,7 +217,7 @@ class Daemon:
                 self.wfile.write(json.dumps(resp).encode() + b"\n")
 
         class Server(socketserver.ThreadingUnixStreamServer):
-            daemon_threads = True
+            daemon_threads: bool = True
 
         server = Server(str(sock), RequestHandler)
         os.chmod(sock, 0o600)
@@ -216,7 +237,7 @@ class Daemon:
         for t in threads:
             t.start()
 
-        def shutdown(signum, _frame):
+        def shutdown(signum: int, _frame: FrameType | None) -> None:
             log.info("received signal %d, shutting down", signum)
             self.stop.set()
             self.scan_now.set()
@@ -239,7 +260,7 @@ class Daemon:
         os._exit(0)
 
 
-def request(req: dict, timeout: float = 30.0) -> dict | None:
+def request(req: dict[str, Any], timeout: float = 30.0) -> dict[str, Any] | None:
     """Send one request to the running daemon; None if it isn't running."""
     import socket
 

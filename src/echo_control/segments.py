@@ -18,6 +18,7 @@ def probe_duration(path: Path) -> float:
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
+        check=False,
     ).stdout.strip()
     try:
         return float(out)
@@ -25,7 +26,7 @@ def probe_duration(path: Path) -> float:
         return 0.0
 
 
-def _db(chunk: np.ndarray) -> float:
+def rms_db(chunk: np.ndarray) -> float:
     rms = float(np.sqrt(np.mean(np.square(chunk), dtype=np.float64)))
     return 20 * math.log10(max(rms, 1e-10))
 
@@ -53,13 +54,14 @@ def _librosa_full(path: Path) -> np.ndarray:
 
     try:
         audio, _ = librosa.load(str(path), sr=SAMPLE_RATE, mono=True)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return np.zeros(0, dtype=np.float32)
     return audio
 
 
 def _select(chunks: Iterable[np.ndarray], stride: int) -> tuple[list[np.ndarray], int]:
-    kept, samples = [], 0
+    kept: list[np.ndarray] = []
+    samples = 0
     for idx, chunk in enumerate(chunks):
         samples += len(chunk)
         if idx % stride == 0 and len(chunk) >= MIN_CHUNK_SECONDS * SAMPLE_RATE:
@@ -90,7 +92,7 @@ def dense_chunks(
     if not chunks:
         return [], duration
 
-    loudness = [_db(c) for c in chunks]
+    loudness = [rms_db(c) for c in chunks]
     keep = [c for c, db in zip(chunks, loudness) if db >= silence_db]
     if not keep:
         keep = [chunks[int(np.argmax(loudness))]]
@@ -133,7 +135,7 @@ def window_starts(length: int, size: int, hop: int) -> list[int]:
     return starts
 
 
-def _to_int16(audio: np.ndarray) -> np.ndarray:
+def to_int16(audio: np.ndarray) -> np.ndarray:
     return (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
 
 
@@ -146,7 +148,7 @@ def _ffmpeg_s16(path: Path) -> np.ndarray:
         stderr=subprocess.DEVNULL,
     )
     assert proc.stdout is not None
-    blocks = []
+    blocks: list[np.ndarray] = []
     try:
         while buf := proc.stdout.read(1 << 22):
             blocks.append(np.frombuffer(buf, dtype=np.int16))
@@ -165,16 +167,16 @@ def sliding_chunks(
     audio = _ffmpeg_s16(path)
     if not len(audio):
         # ffmpeg rejects some files libsndfile reads (e.g. WAV data behind an ID3 header).
-        audio = _to_int16(_librosa_full(path))
+        audio = to_int16(_librosa_full(path))
     size = int(window_seconds * SAMPLE_RATE)
     starts = window_starts(len(audio), size, int(hop_seconds * SAMPLE_RATE))
     win = Windows(audio, starts, size, [], [])
-    win.db = [_db(win.clip(i)) for i in range(len(starts))]
+    win.db = [rms_db(win.clip(i)) for i in range(len(starts))]
     win.silent = [d < silence_db for d in win.db]
     return win, len(audio) / SAMPLE_RATE
 
 
-def _normalize(v: np.ndarray) -> np.ndarray:
+def normalize(v: np.ndarray) -> np.ndarray:
     return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-12)
 
 
@@ -198,7 +200,7 @@ def spherical_kmeans(x: np.ndarray, k: int, iters: int = 25, seed: int = 0) -> n
         for j in range(len(c)):
             members = x[labels == j]
             if len(members):
-                c[j] = _normalize(members.mean(axis=0))
+                c[j] = normalize(members.mean(axis=0))
     return labels
 
 
@@ -212,29 +214,28 @@ def summarize(
     """Reduce per-chunk embeddings to a few normalized centroids plus the share of the track
     each one covers. Small clusters (intros, applause, hidden tracks) are dropped and
     near-duplicate centroids merged, so uniform tracks end up with a single vector."""
-    embs = _normalize(np.asarray(embs, dtype=np.float32))
+    embs = normalize(np.asarray(embs, dtype=np.float32))
     k = max(1, min(max_clusters, math.ceil(len(embs) / chunks_per_cluster), len(embs)))
     labels = spherical_kmeans(embs, k) if k > 1 else np.zeros(len(embs), dtype=int)
 
-    clusters = []
+    clusters: list[tuple[np.ndarray, float]] = []
     for j in np.unique(labels):
         members = embs[labels == j]
-        clusters.append([members.mean(axis=0), len(members) / len(embs)])
+        clusters.append((members.mean(axis=0), len(members) / len(embs)))
     clusters.sort(key=lambda c: -c[1])
 
     kept = [c for c in clusters if c[1] >= min_share] or clusters[:1]
-    merged: list[list] = []
+    merged: list[tuple[np.ndarray, float]] = []
     for vec, share in kept:
-        unit = _normalize(vec)
-        for m in merged:
-            if float(_normalize(m[0]) @ unit) >= merge_threshold:
-                m[0] = m[0] * m[1] + vec * share
-                m[1] += share
-                m[0] /= m[1]
+        unit = normalize(vec)
+        for i, (m_vec, m_share) in enumerate(merged):
+            if float(normalize(m_vec) @ unit) >= merge_threshold:
+                total = m_share + share
+                merged[i] = ((m_vec * m_share + vec * share) / total, total)
                 break
         else:
-            merged.append([vec, share])
+            merged.append((vec, share))
 
-    centroids = _normalize(np.array([m[0] for m in merged]))
+    centroids = normalize(np.array([m[0] for m in merged]))
     shares = np.array([m[1] for m in merged])
     return centroids, shares / shares.sum()

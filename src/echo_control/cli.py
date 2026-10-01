@@ -2,20 +2,23 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import os
 import random
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import NoReturn
 
 from . import config as config_mod
 from .players import BACKENDS, PlayerError, play
 from .store import QdrantUnavailable, is_ready
 
+Handler = Callable[[config_mod.Config, argparse.Namespace], None]
 
-def _die(msg: str, code: int = 1) -> None:
+
+def _die(msg: str, code: int = 1) -> NoReturn:
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(code)
 
@@ -26,7 +29,6 @@ def _contrib_dir() -> Path:
         if candidate.is_dir():
             return candidate
     _die("contrib files not found in the installation")
-    raise AssertionError
 
 
 def _embed_text(cfg: config_mod.Config, text: str) -> list[float]:
@@ -66,8 +68,7 @@ def vibe(argv: list[str] | None = None) -> None:
     p.add_argument(
         "--wander",
         action="store_true",
-        help="start from the best match (or --from) and chain tracks whose intros continue "
-        "the previous outro (chunks strategy only)",
+        help="start from the best match (or --from) and chain tracks whose intros continue the previous outro (chunks strategy only)",
     )
     p.add_argument(
         "--orbit",
@@ -75,8 +76,7 @@ def vibe(argv: list[str] | None = None) -> None:
         const=1.0,
         type=float,
         metavar="N",
-        help="--wander, pulled back toward the query (or the --from track) with strength N "
-        "(default 1; 0 = plain --wander)",
+        help="--wander, pulled back toward the query (or the --from track) with strength N (default 1; 0 = plain --wander)",
     )
     p.add_argument("--from", dest="seed", metavar="FILE", help="seed track for --wander/--orbit")
     p.add_argument(
@@ -134,16 +134,20 @@ def vibe(argv: list[str] | None = None) -> None:
             vector = _embed_text(cfg, query)
         except RuntimeError as e:
             _die(f"embedding failed: {e}")
+    scores = []
     if args.seed:
         seed = str(Path(args.seed).expanduser().resolve())
     else:
+        assert vector is not None
         hits = store.search(vector, 1 if args.wander else limit, cfg.search.share_weight)
         if args.wander and not hits:
             _die("nothing matched to start wandering from")
         seed = hits[0].path if hits else ""
         scores = [(h.path, h.score) for h in hits]
     if args.wander:
+        from .store import ChunkStore
         from .wander import Orbit, walk, wander
+        assert isinstance(store, ChunkStore)
 
         found = store.track(seed)
         if found is None:
@@ -190,25 +194,17 @@ def vibe(argv: list[str] | None = None) -> None:
         _die(str(e))
 
 
-def _setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
-    for noisy in ("httpx", "urllib3", "numba", "watchdog"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+def cmd_daemon(cfg: config_mod.Config, _args: argparse.Namespace) -> None:
+    from .daemon import Daemon, setup_logging
 
-
-def cmd_daemon(cfg: config_mod.Config, _args) -> None:
-    _setup_logging()
-    from .daemon import Daemon
-
+    setup_logging()
     Daemon(cfg).serve()
 
 
-def cmd_scan(cfg: config_mod.Config, _args) -> None:
-    _setup_logging()
+def cmd_scan(cfg: config_mod.Config, _args: argparse.Namespace) -> None:
+    from .daemon import setup_logging
+
+    setup_logging()
     from .clap import load_encoders
     from .indexer import Indexer
     from .store import open_store, wait_ready
@@ -218,7 +214,7 @@ def cmd_scan(cfg: config_mod.Config, _args) -> None:
     print(f"{total} files, {added} indexed, {removed} removed")
 
 
-def cmd_reindex(cfg: config_mod.Config, args) -> None:
+def cmd_reindex(cfg: config_mod.Config, args: argparse.Namespace) -> None:
     from .store import open_store, wait_ready
 
     wait_ready(cfg.qdrant.url, cfg.qdrant.ready_timeout)
@@ -236,7 +232,7 @@ def cmd_reindex(cfg: config_mod.Config, args) -> None:
         cmd_scan(cfg, args)
 
 
-def cmd_status(cfg: config_mod.Config, _args) -> None:
+def cmd_status(cfg: config_mod.Config, _args: argparse.Namespace) -> None:
     from .daemon import request
 
     print(f"config:  {cfg.path or '(defaults, no config file)'}")
@@ -270,7 +266,7 @@ def cmd_status(cfg: config_mod.Config, _args) -> None:
 
 def _run(argv: list[str]) -> None:
     print("$ " + " ".join(argv))
-    r = subprocess.run(argv, capture_output=True, text=True)
+    r = subprocess.run(argv, capture_output=True, text=True, check=False)
     out = (r.stdout + r.stderr).strip()
     if out:
         print(out)
@@ -278,7 +274,7 @@ def _run(argv: list[str]) -> None:
         _die(f"{argv[0]} exited with {r.returncode}")
 
 
-def cmd_install_service(_cfg: config_mod.Config, _args) -> None:
+def cmd_install_service(_cfg: config_mod.Config, _args: argparse.Namespace) -> None:
     contrib = _contrib_dir()
     exe = shutil.which("echo-control") or str(Path(sys.argv[0]).resolve())
     unit_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd/user"
@@ -308,12 +304,12 @@ def cmd_install_service(_cfg: config_mod.Config, _args) -> None:
     print("next: systemctl --user enable --now echo-control")
 
 
-def cmd_install_noctalia(_cfg: config_mod.Config, _args) -> None:
+def cmd_install_noctalia(_cfg: config_mod.Config, _args: argparse.Namespace) -> None:
     if not shutil.which("noctalia"):
         _die("noctalia is not installed")
     source = _contrib_dir() / "noctalia"
     r = subprocess.run(
-        ["noctalia", "msg", "plugins", "source", "list"], capture_output=True, text=True
+        ["noctalia", "msg", "plugins", "source", "list"], capture_output=True, text=True, check=False
     )
     if not any(line.split()[:1] == ["vibe"] for line in r.stdout.splitlines()):
         _run(["noctalia", "msg", "plugins", "source", "add", "vibe", "path", str(source)])
@@ -334,7 +330,7 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
 
     cfg = config_mod.load()
-    handler = {
+    handler: Handler = {
         "daemon": cmd_daemon,
         "scan": cmd_scan,
         "reindex": cmd_reindex,

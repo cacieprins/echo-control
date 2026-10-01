@@ -50,8 +50,8 @@ class Duplicates:
     average. Window vectors are fetched once per track and cached for the walk."""
 
     def __init__(self, store: ChunkStore, cfg: WanderConfig):
-        self.store = store
-        self.cfg = cfg
+        self.store: ChunkStore = store
+        self.cfg: WanderConfig = cfg
         self.windows: dict[str, np.ndarray] = {}
 
     def _windows(self, path: str) -> np.ndarray:
@@ -102,7 +102,7 @@ def rank_next(
         cands += store.intros_of(outro, extra)
         near_center = store.sustained(orbit.center, [c.payload["path"] for c in cands])
 
-    out = []
+    out: list[Transition] = []
     for c in cands:
         if duplicates(c, played):
             continue

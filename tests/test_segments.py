@@ -1,6 +1,6 @@
 import numpy as np
 
-from echo_control.segments import SAMPLE_RATE, Windows, _db, _to_int16, window_starts
+from echo_control.segments import SAMPLE_RATE, Windows, rms_db, to_int16, window_starts
 
 
 def test_window_starts_cover_track_with_one_tail():
@@ -23,10 +23,10 @@ def test_every_sample_is_covered():
 def test_windows_flag_silence_and_report_spans():
     sr = SAMPLE_RATE
     loud = 0.5 * np.sin(np.linspace(0, 2000 * np.pi, 10 * sr))
-    audio = _to_int16(np.concatenate([loud, np.zeros(10 * sr)]))
+    audio = to_int16(np.concatenate([loud, np.zeros(10 * sr)]))
     starts = window_starts(len(audio), 5 * sr, 5 * sr)
     win = Windows(audio, starts, 5 * sr, [], [])
-    win.db = [_db(win.clip(i)) for i in range(len(win))]
+    win.db = [rms_db(win.clip(i)) for i in range(len(win))]
     win.silent = [d < -45 for d in win.db]
     assert win.silent == [False, False, True, True]
     assert win.span(1) == (5.0, 10.0)

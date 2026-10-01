@@ -6,7 +6,9 @@ import queue
 import threading
 from collections.abc import Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from multiprocessing.synchronize import Event as ProcessEvent
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -21,6 +23,8 @@ log = logging.getLogger(__name__)
 DECODE_WORKERS = 4
 
 Key = tuple[float | None, int | None, str | None]
+Decoded = tuple[list[np.ndarray] | Windows, float]
+StopFlag = threading.Event | ProcessEvent
 
 
 def iter_audio_files(
@@ -51,7 +55,7 @@ def is_audio(path: Path, cfg: Config) -> bool:
     )
 
 
-def state_key(payload: dict) -> Key:
+def state_key(payload: dict[str, Any]) -> Key:
     return (payload.get("mtime"), payload.get("size"), payload.get("embedding"))
 
 
@@ -65,10 +69,10 @@ def current_key(path: Path, signature: str) -> Key | None:
 
 class Indexer:
     def __init__(self, cfg: Config, encoders: list[Clap], store: Store | ChunkStore):
-        self.cfg = cfg
-        self.encoders = encoders
-        self.clap = encoders[0]
-        self.store = store
+        self.cfg: Config = cfg
+        self.encoders: list[Clap] = encoders
+        self.clap: Clap = encoders[0]
+        self.store: Store | ChunkStore = store
         store.ensure(self.clap.dim)
 
     def current_key(self, path: Path) -> Key | None:
@@ -78,7 +82,7 @@ class Indexer:
         self,
         path: Path,
         known: dict[str, Key] | None = None,
-        decoded: Future | None = None,
+        decoded: Future[Decoded] | None = None,
         encoder: Clap | None = None,
     ) -> bool:
         """Embed and upsert one file. Returns True if it was (re)indexed."""
@@ -91,20 +95,23 @@ class Indexer:
         if known is not None and known.get(key) == self.current_key(path):
             return False
         encoder = encoder or self.clap
-        chunked = self.cfg.model.strategy == "chunks"
+        vectors: list[list[float]] = []
+        shares: list[float] = []
+        window_vectors = np.zeros((0, self.clap.dim), dtype=np.float32)
         try:
             clips, duration = decoded.result() if decoded else self.clap.decode(path)
             with encoder.lock:
-                if chunked:
-                    vectors = encoder.embed_windows(clips)
+                if isinstance(clips, Windows):
+                    window_vectors = encoder.embed_windows(clips)
                 else:
                     vectors, shares = encoder.embed_decoded(clips)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             log.warning("skipping %s: %s", path, e)
             return False
-        if chunked:
-            self._store_chunks(key, st, clips, vectors, duration)
+        if isinstance(clips, Windows):
+            self._store_chunks(key, st, clips, window_vectors, duration)
             return True
+        assert isinstance(self.store, Store)
         self.store.upsert(
             key,
             vectors,
@@ -149,6 +156,7 @@ class Indexer:
             track_vectors[name] = edge.position.tolist()
             if edge.direction is not None:
                 track_vectors[f"{name}_dir"] = edge.direction.tolist()
+        assert isinstance(self.store, ChunkStore)
         self.store.replace_track(
             key,
             vectors,
@@ -171,7 +179,7 @@ class Indexer:
     def remove(self, paths: Iterable[Path]) -> None:
         self.store.delete_paths([str(p) for p in paths])
 
-    def scan(self, stop: threading.Event | None = None) -> tuple[int, int, int]:
+    def scan(self, stop: StopFlag | None = None) -> tuple[int, int, int]:
         """Full pass: index new/changed files, prune missing ones."""
         known = {p["path"]: state_key(p) for p in self.store.iter_payloads() if "path" in p}
         lib = self.cfg.library
@@ -188,10 +196,10 @@ class Indexer:
             log.info("pruned %d missing files", len(missing))
         return len(files), added, len(missing)
 
-    def index_many(self, todo: list[Path], stop: threading.Event | None = None) -> int:
+    def index_many(self, todo: list[Path], stop: StopFlag | None = None) -> int:
         """Decode on a thread pool and embed on one worker thread per encoder (GPU)."""
         workers = len(self.encoders)
-        work: queue.Queue[tuple[Path, Future] | None] = queue.Queue(maxsize=workers * 4)
+        work: queue.Queue[tuple[Path, Future[Decoded]] | None] = queue.Queue(maxsize=workers * 4)
         progress = {"done": 0, "added": 0}
         progress_lock = threading.Lock()
         def stopped() -> bool:

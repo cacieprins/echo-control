@@ -36,3 +36,18 @@ triton-rocm = { index = "pytorch-rocm" }
 name = "pytorch-rocm"
 url = "https://download.pytorch.org/whl/rocm7.2"
 explicit = true
+
+[tool.basedpyright]
+# numpy, torch and Qdrant payloads are Any-typed throughout; the Any rules can't be met
+# without a cast on every array expression.
+reportAny = false
+reportExplicitAny = false
+reportUnusedCallResult = false
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.40.1",
+    "pre-commit>=4.6.2",
+    "pytest>=9.1.1",
+    "ruff>=0.16.9",
+]

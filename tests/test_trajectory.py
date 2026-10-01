@@ -3,11 +3,13 @@ import numpy as np
 from echo_control import trajectory
 
 
-def _unit(x):
+def _unit(x: np.ndarray) -> np.ndarray:
     return x / np.linalg.norm(x, axis=-1, keepdims=True)
 
 
-def _track(sections, per_section, noise=0.02, dim=64, seed=0):
+def _track(
+    sections: int, per_section: int, noise: float = 0.02, dim: int = 64, seed: int = 0
+) -> tuple[np.ndarray, np.ndarray]:
     """Chunk vectors that jitter around one direction per section."""
     rng = np.random.default_rng(seed)
     centers = _unit(rng.normal(size=(sections, dim)))
