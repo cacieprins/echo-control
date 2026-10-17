@@ -141,7 +141,7 @@ def _payloads(client: QdrantClient, collection: str, paths: list[str]) -> list[d
     return [pt.payload for pt in points if pt.payload]
 
 
-class Store:
+class MultivectorStore:
     def __init__(self, cfg: QdrantConfig, share_weight: float = 0.0):
         self.cfg: QdrantConfig = cfg
         self.share_weight: float = share_weight
@@ -232,6 +232,9 @@ class Store:
         if rerank:
             hits.sort(key=lambda h: -h.score)
         return hits[:limit]
+
+
+Store = MultivectorStore
 
 
 class ChunkStore:

@@ -14,6 +14,7 @@ from .segments import (
     SAMPLE_RATE,
     Windows,
     ffmpeg_decode_cmd,
+    load_clips,
     load_windows,
     normalize,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "Clap",
     "TextEncoder",
     "ffmpeg_decode_cmd",
+    "load_clips",
     "load_encoders",
     "load_windows",
     "prompt",

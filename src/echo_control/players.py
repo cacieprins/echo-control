@@ -69,7 +69,9 @@ def _slug(text: str, limit: int = 60) -> str:
     return re.sub(r"\s+", " ", s)[:limit] or "vibe"
 
 
-def play_mpv(paths: list[str], title: str, detach: bool) -> None:
+def _mpv_argv(
+    paths: list[str], title: str, detach: bool, ipc_sock: Path | None = None
+) -> list[str]:
     if not shutil.which("mpv"):
         raise PlayerError("mpv is not installed (pacman -S mpv), or pick another --player")
     argv = [
@@ -78,9 +80,15 @@ def play_mpv(paths: list[str], title: str, detach: bool) -> None:
         f"--title=vibe: {title}",
         *MPV_WINDOW,
     ]
+    if ipc_sock is not None:
+        argv.append(f"--input-ipc-server={ipc_sock}")
     if detach:
         argv.append("--player-operation-mode=pseudo-gui")
-    _spawn(argv, detach)
+    return argv
+
+
+def play_mpv(paths: list[str], title: str, detach: bool) -> None:
+    _spawn(_mpv_argv(paths, title, detach), detach)
 
 
 class _MpvIpc:
@@ -154,16 +162,7 @@ def play_mpv_continuous(
         if devnull > 2:
             os.close(devnull)
     sock = socket_path().with_name(f"vibe-mpv-{os.getpid()}.sock")
-    argv = [
-        "mpv",
-        f"--playlist={write_m3u(first, title)}",
-        f"--title=vibe: {title}",
-        f"--input-ipc-server={sock}",
-        *MPV_WINDOW,
-    ]
-    if detach:
-        argv.append("--player-operation-mode=pseudo-gui")
-    proc = subprocess.Popen(argv)
+    proc = subprocess.Popen(_mpv_argv(first, title, detach, ipc_sock=sock))
     signal.signal(signal.SIGTERM, _interrupt)
     try:
         with _MpvIpc(sock, proc) as ipc:

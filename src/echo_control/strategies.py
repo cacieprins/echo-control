@@ -14,12 +14,18 @@ from .records import chunk_payload, chunk_track_payload, multivector_payload
 from .segments import (
     Windows,
     dense_chunks,
-    load_windows,
+    load_clips,
     normalize,
     sliding_chunks,
     summarize,
 )
-from .store import ChunkIndex, ChunkStore, MultivectorIndex, Store, VectorIndex
+from .store import (
+    ChunkIndex,
+    ChunkStore,
+    MultivectorIndex,
+    MultivectorStore,
+    VectorIndex,
+)
 
 Decoded = tuple[Any, float]
 
@@ -49,7 +55,7 @@ class Strategy(Protocol):
         encoder: AudioEncoder,
         store: VectorIndex,
     ) -> None: ...
-    def open_store(self, cfg: Config) -> Store | ChunkStore: ...
+    def open_store(self, cfg: Config) -> MultivectorStore | ChunkStore: ...
 
 
 class MeanStrategy:
@@ -60,7 +66,7 @@ class MeanStrategy:
         return f"{cfg.name}|mean|{cfg.windows}x{cfg.window_seconds:g}"
 
     def decode(self, path: Path, cfg: ModelConfig) -> tuple[list[np.ndarray], float]:
-        return load_windows(path, cfg.windows, cfg.window_seconds)
+        return load_clips(path, cfg.windows, cfg.window_seconds)
 
     def embed_and_upsert(
         self,
@@ -83,8 +89,8 @@ class MeanStrategy:
             multivector_payload(path, st, duration, [1.0], self.signature(cfg)),
         )
 
-    def open_store(self, cfg: Config) -> Store:
-        return Store(cfg.qdrant, share_weight=cfg.search.share_weight)
+    def open_store(self, cfg: Config) -> MultivectorStore:
+        return MultivectorStore(cfg.qdrant, share_weight=cfg.search.share_weight)
 
 
 class ClustersStrategy:
@@ -124,8 +130,8 @@ class ClustersStrategy:
             multivector_payload(path, st, duration, rounded_shares, self.signature(cfg)),
         )
 
-    def open_store(self, cfg: Config) -> Store:
-        return Store(cfg.qdrant, share_weight=cfg.search.share_weight)
+    def open_store(self, cfg: Config) -> MultivectorStore:
+        return MultivectorStore(cfg.qdrant, share_weight=cfg.search.share_weight)
 
 
 class ChunksStrategy:
@@ -219,5 +225,5 @@ def get_strategy(cfg_or_name: ModelConfig | str) -> Strategy:
         ) from e
 
 
-def open_store(cfg: Config) -> Store | ChunkStore:
+def open_store(cfg: Config) -> MultivectorStore | ChunkStore:
     return get_strategy(cfg.model).open_store(cfg)

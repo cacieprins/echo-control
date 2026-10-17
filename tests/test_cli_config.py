@@ -10,6 +10,8 @@ from echo_control.config import Config, ModelConfig, PlayerConfig
 
 
 def test_parse_duration() -> None:
+    from echo_control.errors import ConfigError
+
     assert config.parse_duration(42) == 42.0
     assert config.parse_duration(3.5) == 3.5
     assert config.parse_duration("10") == 10.0
@@ -17,7 +19,7 @@ def test_parse_duration() -> None:
     assert config.parse_duration("2.5m") == 150.0
     assert config.parse_duration("6h") == 21600.0
     assert config.parse_duration("1d") == 86400.0
-    with pytest.raises(ValueError, match="invalid duration"):
+    with pytest.raises(ConfigError, match="invalid duration"):
         config.parse_duration("5w")
 
 
@@ -71,20 +73,52 @@ sustain_seconds = 30.0
 
 
 def test_config_load_invalid_strategy_and_hop(tmp_path: Path) -> None:
+    from echo_control.errors import ConfigError
+
     bad_strat = tmp_path / "bad_strat.toml"
     bad_strat.write_text('[model]\nstrategy = "magic"\n')
-    with pytest.raises(ValueError, match="strategy must be"):
+    with pytest.raises(ConfigError, match="strategy must be"):
         config.load(bad_strat)
 
     bad_hop = tmp_path / "bad_hop.toml"
     bad_hop.write_text("[model]\nwindow_seconds = 5.0\nhop_seconds = 10.0\n")
-    with pytest.raises(ValueError, match="hop_seconds"):
+    with pytest.raises(ConfigError, match="hop_seconds"):
         config.load(bad_hop)
 
     zero_hop = tmp_path / "zero_hop.toml"
     zero_hop.write_text("[model]\nhop_seconds = 0.0\n")
-    with pytest.raises(ValueError, match="hop_seconds"):
+    with pytest.raises(ConfigError, match="hop_seconds"):
         config.load(zero_hop)
+
+    bad_section = tmp_path / "bad_section.toml"
+    bad_section.write_text("[ bogus ]\nx = 1\n")
+    with pytest.raises(ConfigError, match=r"unknown config section \[bogus\]"):
+        config.load(bad_section)
+
+    bad_key = tmp_path / "bad_key.toml"
+    bad_key.write_text('[library]\npths = ["/music"]\n')
+    with pytest.raises(ConfigError, match=r"\[library\] unknown key 'pths'"):
+        config.load(bad_key)
+
+    bad_precision = tmp_path / "bad_precision.toml"
+    bad_precision.write_text('[model]\nprecision = "fp16"\n')
+    with pytest.raises(ConfigError, match="precision must be 'fp32' or 'bf16'"):
+        config.load(bad_precision)
+
+    bad_backend = tmp_path / "bad_backend.toml"
+    bad_backend.write_text('[player]\nbackend = "vlc"\n')
+    with pytest.raises(ConfigError, match="backend must be one of"):
+        config.load(bad_backend)
+
+    bad_limit = tmp_path / "bad_limit.toml"
+    bad_limit.write_text("[player]\nlimit = 0\n")
+    with pytest.raises(ConfigError, match="limit must be > 0"):
+        config.load(bad_limit)
+
+    bad_sustain = tmp_path / "bad_sustain.toml"
+    bad_sustain.write_text("[search]\nsustain_seconds = -1.0\n")
+    with pytest.raises(ConfigError, match="sustain_seconds must be > 0"):
+        config.load(bad_sustain)
 
 
 @pytest.mark.parametrize(

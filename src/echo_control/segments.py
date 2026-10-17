@@ -15,7 +15,7 @@ INTRO_START_FRAC = 0.10
 OUTRO_END_FRAC = 0.85
 
 
-def _window_starts(duration: float, windows: int, win: float) -> np.ndarray:
+def _clip_starts(duration: float, windows: int, win: float) -> np.ndarray:
     # Skip intros/outros: sample evenly between 10% and 85% of the track.
     return np.linspace(duration * INTRO_START_FRAC, duration * OUTRO_END_FRAC - win, windows)
 
@@ -26,7 +26,7 @@ def _split_short(audio: np.ndarray, windows: int, win: float) -> list[np.ndarray
     return [c for c in clips if len(c) >= SAMPLE_RATE] or [audio]
 
 
-def _ffmpeg_windows(path: Path, windows: int, win: float) -> tuple[list[np.ndarray], float]:
+def _ffmpeg_clips(path: Path, windows: int, win: float) -> tuple[list[np.ndarray], float]:
     """Fallback for files libsndfile rejects (broken MP3 headers, odd containers)."""
     out = subprocess.run(
         ffmpeg_decode_cmd(path, "f32le"),
@@ -39,11 +39,11 @@ def _ffmpeg_windows(path: Path, windows: int, win: float) -> tuple[list[np.ndarr
     if duration <= win * windows:
         return _split_short(audio, windows, win), duration
     n = int(win * SAMPLE_RATE)
-    starts = _window_starts(duration, windows, win)
+    starts = _clip_starts(duration, windows, win)
     return [audio[int(s * SAMPLE_RATE) : int(s * SAMPLE_RATE) + n] for s in starts], duration
 
 
-def _librosa_windows(path: Path, windows: int, win: float) -> tuple[list[np.ndarray], float]:
+def _librosa_clips(path: Path, windows: int, win: float) -> tuple[list[np.ndarray], float]:
     import librosa
 
     duration = float(librosa.get_duration(path=str(path)))
@@ -51,7 +51,7 @@ def _librosa_windows(path: Path, windows: int, win: float) -> tuple[list[np.ndar
         audio, _ = librosa.load(str(path), sr=SAMPLE_RATE, mono=True, duration=win * windows)
         return _split_short(audio, windows, win), duration
 
-    starts = _window_starts(duration, windows, win)
+    starts = _clip_starts(duration, windows, win)
     clips: list[np.ndarray] = []
     for start in starts:
         audio, _ = librosa.load(
@@ -62,14 +62,17 @@ def _librosa_windows(path: Path, windows: int, win: float) -> tuple[list[np.ndar
     return clips, duration
 
 
-def load_windows(path: Path, windows: int, window_seconds: float) -> tuple[list[np.ndarray], float]:
+def load_clips(path: Path, windows: int, window_seconds: float) -> tuple[list[np.ndarray], float]:
     """Decode a few fixed-length mono clips spread across the track, plus its duration."""
     try:
-        return _librosa_windows(path, windows, window_seconds)
+        return _librosa_clips(path, windows, window_seconds)
     except Exception:
         if not shutil.which("ffmpeg"):
             raise
-        return _ffmpeg_windows(path, windows, window_seconds)
+        return _ffmpeg_clips(path, windows, window_seconds)
+
+
+load_windows = load_clips
 
 
 def probe_duration(path: Path) -> float:
