@@ -9,21 +9,34 @@ import socketserver
 import sys
 import threading
 import time
+from collections.abc import Callable
 from multiprocessing.connection import Connection
 from multiprocessing.synchronize import Event
 from pathlib import Path
 from types import FrameType
-from typing import Any, override
+from typing import Any, NoReturn, Protocol, override
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .clap import TextEncoder, signature
 from .config import Config, socket_path
-from .indexer import Key, current_key, is_audio, state_key
-from .store import ChunkStore, Store, open_store, wait_ready
+from .indexer import current_key, is_audio, state_key
+from .records import ScanKey, ScanStats
+from .store import VectorIndex, wait_ready
+from .strategies import open_store
 
 log = logging.getLogger(__name__)
+
+DEBOUNCE_SECONDS = 5.0
+# Reads (including our own while embedding) emit "opened" and "closed_no_write"; ignore them.
+CHANGE_EVENTS = {"created", "modified", "moved", "deleted", "closed"}
+
+
+class TextEmbedder(Protocol):
+    dim: int
+
+    def embed_text(self, text: str) -> list[float]: ...
 
 
 def setup_logging() -> None:
@@ -36,11 +49,18 @@ def setup_logging() -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
+def _hard_exit(code: int) -> NoReturn:
+    """Skip normal interpreter teardown, which aborts inside ROCm/OpenBLAS worker threads
+    (SIGABRT core dump); every upsert is already committed before exiting."""
+    logging.shutdown()
+    os._exit(code)
+
+
 def _index_job(
     cfg: Config,
     paths: list[str] | None,
     stop: Event,
-    conn: Connection[tuple[int, int, int] | int, object],
+    conn: Connection[ScanStats | int, object],
 ) -> None:
     """Runs in a spawned child: loads the GPU encoders, indexes, and exits, which is the
     only way to get rid of ROCm's spinning runtime thread once the GPU has been used."""
@@ -57,19 +77,86 @@ def _index_job(
             conn.send(indexer.scan(stop))
         else:
             conn.send(indexer.index_many([Path(p) for p in paths], stop))
-    except BaseException:
+    except Exception:
         log.exception("indexing failed")
         code = 1
     finally:
         conn.close()
-        logging.shutdown()
-        # Interpreter teardown aborts inside ROCm/OpenBLAS worker threads (SIGABRT core
-        # dump); every upsert is already committed, so skip it.
-        os._exit(code)
+        _hard_exit(code)
 
-DEBOUNCE_SECONDS = 5.0
-# Reads (including our own while embedding) emit "opened" and "closed_no_write"; ignore them.
-CHANGE_EVENTS = {"created", "modified", "moved", "deleted", "closed"}
+
+class DaemonState:
+    """Thread-safe daemon runtime status."""
+
+    def __init__(self, started: float | None = None):
+        self._lock: threading.Lock = threading.Lock()
+        self.started: float = time.time() if started is None else started
+        self.scanning: bool = False
+        self.indexing: bool = False
+        self.last_scan: dict[str, Any] | None = None
+
+    def set_scanning(self, value: bool) -> None:
+        with self._lock:
+            self.scanning = value
+
+    def set_indexing(self, value: bool) -> None:
+        with self._lock:
+            self.indexing = value
+
+    def record_scan(self, stats: ScanStats, at: float | None = None) -> None:
+        total, added, removed = stats
+        with self._lock:
+            self.last_scan = {
+                "at": time.time() if at is None else at,
+                "files": total,
+                "indexed": added,
+                "removed": removed,
+            }
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "started": self.started,
+                "scanning": self.scanning,
+                "indexing": self.indexing,
+                "last_scan": dict(self.last_scan) if self.last_scan else None,
+            }
+
+    def __getitem__(self, key: str) -> Any:
+        return self.snapshot()[key]
+
+
+class PendingQueue:
+    """Thread-safe debounce queue for changed library paths."""
+
+    def __init__(
+        self,
+        debounce_seconds: float = DEBOUNCE_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.debounce_seconds: float = debounce_seconds
+        self.clock: Callable[[], float] = clock
+        self._lock: threading.Lock = threading.Lock()
+        self._pending: dict[Path, float] = {}
+
+    def mark_changed(self, path: Path, now: float | None = None) -> None:
+        ts = self.clock() if now is None else now
+        with self._lock:
+            self._pending[path] = ts
+
+    def take_ready(self, now: float | None = None) -> list[Path]:
+        ts = self.clock() if now is None else now
+        with self._lock:
+            ready = [
+                p for p, t in self._pending.items() if ts - t >= self.debounce_seconds
+            ]
+            for p in ready:
+                del self._pending[p]
+            return ready
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._pending)
 
 
 class _Handler(FileSystemEventHandler):
@@ -81,28 +168,35 @@ class _Handler(FileSystemEventHandler):
         if event.event_type not in CHANGE_EVENTS:
             return
         if event.is_directory:
-            if event.event_type in ("created", "moved"):
+            if event.event_type in ("created", "moved", "deleted"):
                 self.daemon.request_scan()
             return
         for p in (event.src_path, getattr(event, "dest_path", "")):
             if p:
-                self.daemon.touch(Path(os.fsdecode(p)))
+                self.daemon.mark_changed(Path(os.fsdecode(p)))
 
 
 class Daemon:
-    def __init__(self, cfg: Config):
+    def __init__(
+        self,
+        cfg: Config,
+        *,
+        text: TextEmbedder | None = None,
+        store: VectorIndex | None = None,
+        pending: PendingQueue | None = None,
+    ):
         self.cfg: Config = cfg
         self.stop: threading.Event = threading.Event()
         self.scan_now: threading.Event = threading.Event()
-        self.pending: dict[Path, float] = {}
-        self.pending_lock: threading.Lock = threading.Lock()
-        self.state: dict[str, Any] = {"started": time.time(), "scanning": False, "indexing": False, "last_scan": None}
+        self.pending: PendingQueue = pending if pending is not None else PendingQueue()
+        self.state: DaemonState = DaemonState()
         self.job_lock: threading.Lock = threading.Lock()
         self.signature: str = signature(cfg.model)
 
-        wait_ready(cfg.qdrant.url, cfg.qdrant.ready_timeout)
-        self.text: TextEncoder = TextEncoder(cfg.model)
-        self.store: Store | ChunkStore = open_store(cfg)
+        if store is None:
+            wait_ready(cfg.qdrant.url, cfg.qdrant.ready_timeout)
+        self.text: TextEmbedder = text or TextEncoder(cfg.model)
+        self.store: VectorIndex = store or open_store(cfg)
         self.store.ensure(self.text.dim)
 
     def _run_job(self, paths: list[Path] | None) -> Any:
@@ -116,7 +210,7 @@ class Daemon:
             stop = ctx.Event()
             args = (self.cfg, None if paths is None else [str(p) for p in paths], stop, send)
             proc = ctx.Process(target=_index_job, args=args, name="echo-control-index")
-            self.state["indexing"] = True
+            self.state.set_indexing(True)
             try:
                 proc.start()
                 send.close()
@@ -127,59 +221,60 @@ class Daemon:
                 result = recv.recv() if recv.poll() else None
             finally:
                 recv.close()
-                self.state["indexing"] = False
+                self.state.set_indexing(False)
             if proc.exitcode != 0:
                 log.error("indexing process exited with %s", proc.exitcode)
             return result
 
-    def touch(self, path: Path) -> None:
+    def mark_changed(self, path: Path) -> None:
         if is_audio(path, self.cfg):
-            with self.pending_lock:
-                self.pending[path] = time.monotonic()
+            self.pending.mark_changed(path)
+
+    def touch(self, path: Path) -> None:
+        self.mark_changed(path)
 
     def request_scan(self) -> None:
         self.scan_now.set()
 
     def _scan_loop(self) -> None:
         while not self.stop.is_set():
-            self.state["scanning"] = True
+            self.state.set_scanning(True)
+            result = None
             try:
                 result = self._run_job(None)
+            except Exception:
+                log.exception("scan job failed")
             finally:
-                self.state["scanning"] = False
+                self.state.set_scanning(False)
             if result is not None:
-                total, added, removed = result
-                self.state["last_scan"] = {
-                    "at": time.time(), "files": total, "indexed": added, "removed": removed
-                }
+                self.state.record_scan(result)
             self.scan_now.wait(self.cfg.library.rescan_interval)
             self.scan_now.clear()
 
     def _pending_loop(self) -> None:
         while not self.stop.wait(1.0):
-            now = time.monotonic()
-            with self.pending_lock:
-                ready = [p for p, t in self.pending.items() if now - t >= DEBOUNCE_SECONDS]
-                for p in ready:
-                    del self.pending[p]
-            if not ready:
-                continue
-            gone = [p for p in ready if not p.exists()]
-            if gone:
-                self.store.delete_paths([str(p) for p in gone])
-                for p in gone:
-                    log.info("removed %s", p)
-            known = self._known(ready)
-            changed = [
-                p for p in ready
-                if p.exists() and known.get(str(p)) != current_key(p, self.signature)
-            ]
-            if changed:
-                added = self._run_job(changed)
-                if added is not None:
-                    log.info("indexed %d of %d changed files", added, len(changed))
+            self.flush_pending()
 
-    def _known(self, paths: list[Path]) -> dict[str, Key]:
+    def flush_pending(self, now: float | None = None) -> None:
+        ready = self.pending.take_ready(now)
+        if not ready:
+            return
+        gone = [p for p in ready if not p.exists()]
+        if gone:
+            self.store.delete_paths([str(p) for p in gone])
+            for p in gone:
+                log.info("removed %s", p)
+        known = self._known(ready)
+        changed = [
+            p for p in ready
+            if p.exists() and known.get(str(p)) != current_key(p, self.signature)
+        ]
+        if changed:
+            added = self._run_job(changed)
+            if added is not None:
+                log.info("indexed %d of %d changed files", added, len(changed))
+
+    def _known(self, paths: list[Path]) -> dict[str, ScanKey]:
         payloads = self.store.payloads([str(p) for p in paths])
         return {pl["path"]: state_key(pl) for pl in payloads}
 
@@ -188,14 +283,12 @@ class Daemon:
         if op == "embed":
             return {"vector": self.text.embed_text(str(req["text"]))}
         if op == "status":
-            with self.pending_lock:
-                pending = len(self.pending)
             return {
-                **self.state,
-                "pending": pending,
+                **self.state.snapshot(),
+                "pending": len(self.pending),
                 "device": self.cfg.model.device,
                 "model": self.cfg.model.name,
-                "strategy": self.cfg.model.strategy,
+                "strategy": str(self.cfg.model.strategy),
                 "indexed": self.store.count(),
             }
         return {"error": f"unknown op {op!r}"}
@@ -214,7 +307,10 @@ class Daemon:
                 except Exception as e:
                     log.exception("request failed")
                     resp = {"error": str(e)}
-                self.wfile.write(json.dumps(resp).encode() + b"\n")
+                try:
+                    self.wfile.write(json.dumps(resp).encode() + b"\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
 
         class Server(socketserver.ThreadingUnixStreamServer):
             daemon_threads: bool = True
@@ -254,10 +350,7 @@ class Daemon:
         observer.join(timeout=5)
         for t in threads[:2]:
             t.join(timeout=30)
-        logging.shutdown()
-        # Normal interpreter teardown aborts inside ROCm/OpenBLAS worker threads (SIGABRT
-        # core dump); every upsert is already committed, so skip it.
-        os._exit(0)
+        _hard_exit(0)
 
 
 def request(req: dict[str, Any], timeout: float = 30.0) -> dict[str, Any] | None:
@@ -278,7 +371,9 @@ def request(req: dict[str, Any], timeout: float = 30.0) -> dict[str, Any] | None
                 if not chunk:
                     break
                 buf += chunk
-    except (ConnectionRefusedError, FileNotFoundError, TimeoutError):
+    except (ConnectionRefusedError, FileNotFoundError, TimeoutError, OSError):
+        return None
+    if not buf.strip():
         return None
     resp = json.loads(buf)
     if "error" in resp:

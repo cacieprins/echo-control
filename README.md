@@ -15,9 +15,8 @@ Tags are never read; matching is purely on how the audio sounds.
 
 ```bash
 uv tool install --editable .          # installs `vibe` and `echo-control` into ~/.local/bin
-mkdir -p ~/.config/echo-control
-cp contrib/config.example.toml ~/.config/echo-control/config.toml   # edit library paths
-echo-control install-service          # docker-compose + systemd user units
+echo-control install-service          # writes config.toml, docker-compose + systemd user units
+# edit ~/.config/echo-control/config.toml to set [library] paths
 systemctl --user enable --now echo-control
 echo-control status
 ```
@@ -28,7 +27,8 @@ The first scan is slow on CPU; watch it with `journalctl --user -fu echo-control
 ## Commands
 
 - `vibe "<query>"` plays results with the configured backend. Options: `-n/--limit`,
-  `--player {mpv,spotatui,command,stdout}`, `--shuffle`, `--print` (M3U to stdout), `--json`.
+  `--player {mpv,spotatui,command,stdout}`, `--shuffle`, `--print` (M3U to stdout), `--json`,
+  `--detach`, `--play-path FILE...`.
   When stdout is not a terminal, an M3U is printed instead of playing.
 - `vibe --wander "<query>"` / `vibe --wander --from FILE` starts at the best match (or FILE)
   and chains tracks whose intro picks up where the previous outro left off. Needs the
@@ -57,7 +57,7 @@ uses, re-embeds the library on the next scan. `clusters` and `mean` share `<coll
 
 | strategy | stored per track | good for |
 | --- | --- | --- |
-| `clusters` (default) | up to `max_clusters` centroids of its 10s chunks | best-section search |
+| `clusters` (default) | up to `max_clusters` centroids of its `window_seconds` chunks | best-section search |
 | `mean` | one vector averaged from `windows` clips | fast indexing, blurrier matches |
 | `chunks` | every window, with its position | positions, trajectories, `--wander` |
 
@@ -82,9 +82,10 @@ a single vector, in `<collection>`.
 `<collection>_chunks`, with no cap. Expect about 4× the embedding work of `clusters` for
 typical tracks, and far more for long mixes. Silent windows are kept and flagged so
 positions stay evenly spaced. Search ranks each track by the mean similarity of its best
-`[search] sustain_seconds` (60) of non-silent windows, so a track has to hold the vibe
-rather than match it for one moment. 10 means the single best window; tracks shorter than
-the setting are averaged over their whole length.
+`round(sustain_seconds / hop_seconds)` (`[search] sustain_seconds` = 60) non-silent windows,
+so a track has to hold the vibe rather than match it for one moment. `sustain_seconds <= hop_seconds`
+means the single best window (10s at a 2.5s hop averages 4 windows); tracks with fewer windows
+are averaged over their whole length.
 
 - Each chunk's payload has `idx`/`total`, `start`/`end` (seconds), `db`, `silent`, and
   `speed`: the angle travelled through embedding space since the previous window, per second.

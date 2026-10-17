@@ -4,26 +4,22 @@ import logging
 import os
 import queue
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from multiprocessing.synchronize import Event as ProcessEvent
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
-from . import trajectory
-from .clap import Clap
 from .config import Config
-from .segments import Windows
-from .store import ChunkStore, Store
+from .records import ScanKey, ScanStats
+from .store import VectorIndex
+from .strategies import AudioEncoder, Decoded, Strategy, get_strategy
 
 log = logging.getLogger(__name__)
 
 DECODE_WORKERS = 4
 
-Key = tuple[float | None, int | None, str | None]
-Decoded = tuple[list[np.ndarray] | Windows, float]
+Key = ScanKey
 StopFlag = threading.Event | ProcessEvent
 
 
@@ -55,35 +51,41 @@ def is_audio(path: Path, cfg: Config) -> bool:
     )
 
 
-def state_key(payload: dict[str, Any]) -> Key:
-    return (payload.get("mtime"), payload.get("size"), payload.get("embedding"))
+def state_key(payload: dict[str, Any]) -> ScanKey:
+    return ScanKey(payload.get("mtime"), payload.get("size"), payload.get("embedding"))
 
 
-def current_key(path: Path, signature: str) -> Key | None:
+def current_key(path: Path, signature: str) -> ScanKey | None:
     try:
         st = path.stat()
     except OSError:
         return None
-    return (st.st_mtime, st.st_size, signature)
+    return ScanKey(st.st_mtime, st.st_size, signature)
 
 
 class Indexer:
-    def __init__(self, cfg: Config, encoders: list[Clap], store: Store | ChunkStore):
+    def __init__(self, cfg: Config, encoders: Sequence[AudioEncoder], store: VectorIndex):
         self.cfg: Config = cfg
-        self.encoders: list[Clap] = encoders
-        self.clap: Clap = encoders[0]
-        self.store: Store | ChunkStore = store
-        store.ensure(self.clap.dim)
+        self.strategy: Strategy = get_strategy(cfg.model)
+        self.signature: str = self.strategy.signature(cfg.model)
+        self.encoders: Sequence[AudioEncoder] = encoders
+        self.encoder: AudioEncoder = encoders[0]
+        self.clap: AudioEncoder = encoders[0]
+        self.store: VectorIndex = store
+        store.ensure(self.encoder.dim)
 
-    def current_key(self, path: Path) -> Key | None:
-        return current_key(path, self.clap.signature)
+    def current_key(self, path: Path) -> ScanKey | None:
+        return current_key(path, self.signature)
+
+    def decode(self, path: Path) -> Decoded:
+        return self.strategy.decode(path, self.cfg.model)
 
     def index_file(
         self,
         path: Path,
-        known: dict[str, Key] | None = None,
+        known: dict[str, ScanKey] | None = None,
         decoded: Future[Decoded] | None = None,
-        encoder: Clap | None = None,
+        encoder: AudioEncoder | None = None,
     ) -> bool:
         """Embed and upsert one file. Returns True if it was (re)indexed."""
         try:
@@ -94,92 +96,19 @@ class Indexer:
         key = str(path)
         if known is not None and known.get(key) == self.current_key(path):
             return False
-        encoder = encoder or self.clap
-        vectors: list[list[float]] = []
-        shares: list[float] = []
-        window_vectors = np.zeros((0, self.clap.dim), dtype=np.float32)
+        encoder = encoder or self.encoder
         try:
-            clips, duration = decoded.result() if decoded else self.clap.decode(path)
-            with encoder.lock:
-                if isinstance(clips, Windows):
-                    window_vectors = encoder.embed_windows(clips)
-                else:
-                    vectors, shares = encoder.embed_decoded(clips)
+            dec = decoded.result() if decoded else self.decode(path)
+            self.strategy.embed_and_upsert(key, st, dec, self.cfg.model, encoder, self.store)
         except Exception as e:  # noqa: BLE001
             log.warning("skipping %s: %s", path, e)
             return False
-        if isinstance(clips, Windows):
-            self._store_chunks(key, st, clips, window_vectors, duration)
-            return True
-        assert isinstance(self.store, Store)
-        self.store.upsert(
-            key,
-            vectors,
-            {
-                "path": key,
-                "mtime": st.st_mtime,
-                "size": st.st_size,
-                "duration": duration,
-                "shares": shares,
-                "embedding": self.clap.signature,
-            },
-        )
         return True
-
-    def _store_chunks(
-        self, key: str, st: os.stat_result, windows: Windows, vectors: np.ndarray, duration: float
-    ) -> None:
-        spans = [windows.span(i) for i in range(len(windows))]
-        starts = np.array([s for s, _ in spans])
-        speed = trajectory.speeds(vectors, starts)
-        chunk_payloads = [
-            {
-                "path": key,
-                "idx": i,
-                "total": len(windows),
-                "start": round(start, 3),
-                "end": round(end, 3),
-                "db": round(windows.db[i], 2),
-                "silent": windows.silent[i],
-                "speed": None if np.isnan(speed[i]) else round(float(speed[i]), 5),
-            }
-            for i, (start, end) in enumerate(spans)
-        ]
-        loud = ~np.array(windows.silent)
-        mean = vectors[loud].mean(axis=0) if loud.any() else vectors.mean(axis=0)
-        mean /= max(float(np.linalg.norm(mean)), 1e-12)
-        intro, outro = trajectory.edges(
-            vectors, starts, windows.silent, windows.db, self.cfg.model.edge_seconds
-        )
-        track_vectors = {"mean": mean.tolist()}
-        for name, edge in (("intro", intro), ("outro", outro)):
-            track_vectors[name] = edge.position.tolist()
-            if edge.direction is not None:
-                track_vectors[f"{name}_dir"] = edge.direction.tolist()
-        assert isinstance(self.store, ChunkStore)
-        self.store.replace_track(
-            key,
-            vectors,
-            chunk_payloads,
-            track_vectors,
-            {
-                "intro_drift": round(intro.drift, 6),
-                "outro_drift": round(outro.drift, 6),
-                "path": key,
-                "mtime": st.st_mtime,
-                "size": st.st_size,
-                "duration": duration,
-                "embedding": self.clap.signature,
-                "n_chunks": len(windows),
-                "silent": not loud.any(),
-                **trajectory.summarize(vectors, starts, self.cfg.model.window_seconds),
-            },
-        )
 
     def remove(self, paths: Iterable[Path]) -> None:
         self.store.delete_paths([str(p) for p in paths])
 
-    def scan(self, stop: StopFlag | None = None) -> tuple[int, int, int]:
+    def scan(self, stop: StopFlag | None = None) -> ScanStats:
         """Full pass: index new/changed files, prune missing ones."""
         known = {p["path"]: state_key(p) for p in self.store.iter_payloads() if "path" in p}
         lib = self.cfg.library
@@ -194,7 +123,7 @@ class Indexer:
         self.store.delete_paths(missing)
         if missing:
             log.info("pruned %d missing files", len(missing))
-        return len(files), added, len(missing)
+        return ScanStats(len(files), added, len(missing))
 
     def index_many(self, todo: list[Path], stop: StopFlag | None = None) -> int:
         """Decode on a thread pool and embed on one worker thread per encoder (GPU)."""
@@ -205,7 +134,7 @@ class Indexer:
         def stopped() -> bool:
             return stop is not None and stop.is_set()
 
-        def consume(encoder: Clap) -> None:
+        def consume(encoder: AudioEncoder) -> None:
             while (item := work.get()) is not None:
                 f, fut = item
                 if stopped():
@@ -229,7 +158,7 @@ class Indexer:
             for f in todo:
                 if stopped():
                     break
-                work.put((f, pool.submit(self.clap.decode, f)))
+                work.put((f, pool.submit(self.decode, f)))
             for _ in consumers:
                 work.put(None)
             for t in consumers:

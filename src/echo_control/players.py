@@ -15,18 +15,20 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 from types import FrameType
-from typing import Any
+from typing import Any, Self
 
 from .config import DATA_DIR, PlayerConfig, socket_path
+from .errors import EchoControlError
 
 BACKENDS = ("mpv", "spotatui", "command", "stdout")
 CONTINUOUS_AHEAD = 3
+M3U_KEEP = 20
 # mpv only opens a window for a video track, and cover art counts as one; without this the
 # window closes on every track that has no art.
 MPV_WINDOW = ("--force-window=immediate",)
 
 
-class PlayerError(RuntimeError):
+class PlayerError(EchoControlError):
     pass
 
 
@@ -44,7 +46,7 @@ def write_m3u(paths: list[str], title: str) -> Path:
     fd, name = tempfile.mkstemp(prefix="vibe-", suffix=".m3u", dir=out)
     with os.fdopen(fd, "w") as f:
         f.write(m3u(paths, title))
-    for old in sorted(out.glob("vibe-*.m3u"), key=lambda p: p.stat().st_mtime)[:-20]:
+    for old in sorted(out.glob("vibe-*.m3u"), key=lambda p: p.stat().st_mtime)[:-M3U_KEEP]:
         old.unlink(missing_ok=True)
     return Path(name)
 
@@ -67,7 +69,9 @@ def _slug(text: str, limit: int = 60) -> str:
     return re.sub(r"\s+", " ", s)[:limit] or "vibe"
 
 
-def play_mpv(paths: list[str], title: str, detach: bool) -> None:
+def _mpv_argv(
+    paths: list[str], title: str, detach: bool, ipc_sock: Path | None = None
+) -> list[str]:
     if not shutil.which("mpv"):
         raise PlayerError("mpv is not installed (pacman -S mpv), or pick another --player")
     argv = [
@@ -76,9 +80,15 @@ def play_mpv(paths: list[str], title: str, detach: bool) -> None:
         f"--title=vibe: {title}",
         *MPV_WINDOW,
     ]
+    if ipc_sock is not None:
+        argv.append(f"--input-ipc-server={ipc_sock}")
     if detach:
         argv.append("--player-operation-mode=pseudo-gui")
-    _spawn(argv, detach)
+    return argv
+
+
+def play_mpv(paths: list[str], title: str, detach: bool) -> None:
+    _spawn(_mpv_argv(paths, title, detach), detach)
 
 
 class _MpvIpc:
@@ -90,15 +100,25 @@ class _MpvIpc:
         self.next_id: int = 0
         deadline = time.monotonic() + timeout
         while True:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self.sock.connect(str(path))
+                sock.connect(str(path))
+                self.sock = sock
                 break
             except (FileNotFoundError, ConnectionRefusedError):
-                self.sock.close()
+                sock.close()
                 if proc.poll() is not None or time.monotonic() > deadline:
                     raise PlayerError("mpv exited before its IPC socket came up") from None
                 time.sleep(0.1)
+
+    def close(self) -> None:
+        self.sock.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def command(self, *args: Any) -> Any:
         self.next_id += 1
@@ -139,32 +159,25 @@ def play_mpv_continuous(
         devnull = os.open(os.devnull, os.O_RDWR)
         for fd in (0, 1, 2):
             os.dup2(devnull, fd)
+        if devnull > 2:
+            os.close(devnull)
     sock = socket_path().with_name(f"vibe-mpv-{os.getpid()}.sock")
-    argv = [
-        "mpv",
-        f"--playlist={write_m3u(first, title)}",
-        f"--title=vibe: {title}",
-        f"--input-ipc-server={sock}",
-        *MPV_WINDOW,
-    ]
-    if detach:
-        argv.append("--player-operation-mode=pseudo-gui")
-    proc = subprocess.Popen(argv)
+    proc = subprocess.Popen(_mpv_argv(first, title, detach, ipc_sock=sock))
     signal.signal(signal.SIGTERM, _interrupt)
     try:
-        ipc = _MpvIpc(sock, proc)
-        exhausted = False
-        while proc.poll() is None and not exhausted:
-            pos = ipc.command("get_property", "playlist-pos")
-            count = ipc.command("get_property", "playlist-count")
-            while count - max(pos, 0) - 1 < ahead:
-                path = next(tracks, None)
-                if path is None:
-                    exhausted = True
-                    break
-                ipc.command("loadfile", path, "append")
-                count += 1
-            time.sleep(1.0)
+        with _MpvIpc(sock, proc) as ipc:
+            exhausted = False
+            while proc.poll() is None and not exhausted:
+                pos = ipc.command("get_property", "playlist-pos") or 0
+                count = ipc.command("get_property", "playlist-count") or 0
+                while count - max(pos, 0) - 1 < ahead:
+                    path = next(tracks, None)
+                    if path is None:
+                        exhausted = True
+                        break
+                    ipc.command("loadfile", path, "append")
+                    count += 1
+                time.sleep(1.0)
         proc.wait()
     except (ConnectionError, BrokenPipeError):
         proc.wait()

@@ -14,8 +14,8 @@ precision = "bf16"     # bf16 | fp32 for audio on GPU; bf16 is ~4x faster (fp16 
 batch_size = 8
 window_seconds = 10.0
 # How a track becomes vectors. Changing any of these re-embeds the library on the next scan.
-#   clusters: embed every 10s chunk, k-means them, store up to max_clusters centroids per
-#             track; a query matches a track's best section.
+#   clusters: embed every window_seconds chunk, k-means them, store up to max_clusters
+#             centroids per track; a query matches a track's best section.
 #   mean:     average `windows` evenly spaced clips into a single vector (faster, blurrier).
 #   chunks:   store every window_seconds window, every hop_seconds, as its own point with its
 #             position, loudness and speed through embedding space, in <collection>_chunks
@@ -42,8 +42,9 @@ ready_timeout = 60     # seconds to wait for qdrant at daemon startup
 # centroid covers. 0 = pure best-section match (best in testing); 0.5 already over-rewards
 # uniform tracks.
 share_weight = 0.0
-# chunks strategy: rank tracks by their mean similarity over their best this-many seconds of
-# windows. window_seconds (10) = the single best window; larger = the vibe must be sustained.
+# chunks strategy: rank tracks by their mean similarity over their best
+# round(sustain_seconds / hop_seconds) non-silent windows. <= hop_seconds = the single best
+# window; 10s at 2.5s hop = 4 windows; larger = the vibe must be sustained.
 sustain_seconds = 60
 
 [wander]

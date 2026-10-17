@@ -3,9 +3,22 @@ from __future__ import annotations
 import os
 import re
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+from .errors import ConfigError
+
+PRECISIONS = ("fp32", "bf16")
+PLAYER_BACKENDS = ("mpv", "spotatui", "command", "stdout")
+
+
+class StrategyName(StrEnum):
+    MEAN = "mean"
+    CLUSTERS = "clusters"
+    CHUNKS = "chunks"
+
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "echo-control"
 CONFIG_PATH = CONFIG_DIR / "config.toml"
@@ -26,7 +39,7 @@ def parse_duration(value: str | float) -> float:
         return float(value)
     m = _DURATION_RE.match(value)
     if not m:
-        raise ValueError(f"invalid duration: {value!r}")
+        raise ConfigError(f"invalid duration: {value!r}")
     return float(m.group(1)) * _UNITS[m.group(2)]
 
 
@@ -49,7 +62,7 @@ class ModelConfig:
     windows: int = 3
     window_seconds: float = 10.0
     text_prefix: str = "A recording of "
-    strategy: str = "clusters"
+    strategy: str = StrategyName.CLUSTERS
     max_clusters: int = 4
     min_cluster_share: float = 0.12
     merge_threshold: float = 0.85
@@ -102,12 +115,38 @@ class Config:
     path: Path | None = None
 
 
+_SECTION_TYPES: dict[str, type[Any]] = {
+    "library": LibraryConfig,
+    "model": ModelConfig,
+    "qdrant": QdrantConfig,
+    "player": PlayerConfig,
+    "search": SearchConfig,
+    "wander": WanderConfig,
+}
+
+
+def _check_section_keys(section: str, data: dict[str, Any], cls: type[Any]) -> None:
+    allowed = {f.name for f in fields(cls)}
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        raise ConfigError(f"[{section}] unknown key {unknown[0]!r}")
+
+
 def load(path: Path | None = None) -> Config:
     path = path or Path(os.environ.get("ECHO_CONTROL_CONFIG", CONFIG_PATH))
     raw: dict[str, Any] = {}
     if path.exists():
         with path.open("rb") as f:
             raw = tomllib.load(f)
+
+    unknown_sections = sorted(set(raw) - set(_SECTION_TYPES))
+    if unknown_sections:
+        raise ConfigError(f"unknown config section [{unknown_sections[0]}]")
+    for sec, cls in _SECTION_TYPES.items():
+        if sec in raw:
+            if not isinstance(raw[sec], dict):
+                raise ConfigError(f"[{sec}] must be a table")
+            _check_section_keys(sec, raw[sec], cls)
 
     lib = raw.get("library", {})
     library = LibraryConfig()
@@ -117,30 +156,44 @@ def load(path: Path | None = None) -> Config:
         library.extensions = [e.lower().lstrip(".") for e in lib["extensions"]]
     if "rescan_interval" in lib:
         library.rescan_interval = parse_duration(lib["rescan_interval"])
-    if "exclude" in lib:
-        library.exclude = [Path(p).expanduser().resolve() for p in lib["exclude"]]
 
     player_raw = dict(raw.get("player", {}))
     if "spotatui_dir" in player_raw:
         player_raw["spotatui_dir"] = Path(player_raw["spotatui_dir"]).expanduser().resolve()
     player = PlayerConfig(**player_raw)
+    if player.backend not in PLAYER_BACKENDS:
+        raise ConfigError(
+            f"[player] backend must be one of {', '.join(PLAYER_BACKENDS)}, not {player.backend!r}"
+        )
+    if player.limit <= 0:
+        raise ConfigError("[player] limit must be > 0")
+
     # Generated spotatui playlists are symlinks into the library; never index them.
-    library.exclude.append(player.spotatui_dir.expanduser().resolve())
+    configured_exclude = [Path(p).expanduser().resolve() for p in lib.get("exclude", [])]
+    library.exclude = [*configured_exclude, player.spotatui_dir.expanduser().resolve()]
 
     model = ModelConfig(**raw.get("model", {}))
-    if model.strategy not in ("mean", "clusters", "chunks"):
-        raise ValueError(
+    if model.strategy not in StrategyName:
+        raise ConfigError(
             f"[model] strategy must be 'mean', 'clusters' or 'chunks', not {model.strategy!r}"
         )
+    if model.precision not in PRECISIONS:
+        raise ConfigError(
+            f"[model] precision must be 'fp32' or 'bf16', not {model.precision!r}"
+        )
     if not 0 < model.hop_seconds <= model.window_seconds:
-        raise ValueError("[model] hop_seconds must be > 0 and <= window_seconds")
+        raise ConfigError("[model] hop_seconds must be > 0 and <= window_seconds")
+
+    search = SearchConfig(**raw.get("search", {}))
+    if search.sustain_seconds <= 0:
+        raise ConfigError("[search] sustain_seconds must be > 0")
 
     return Config(
         library=library,
         model=model,
         qdrant=QdrantConfig(**raw.get("qdrant", {})),
         player=player,
-        search=SearchConfig(**raw.get("search", {})),
+        search=search,
         wander=WanderConfig(**raw.get("wander", {})),
         path=path if path.exists() else None,
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import shutil
 import subprocess
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -10,6 +11,68 @@ import numpy as np
 
 SAMPLE_RATE = 48_000
 MIN_CHUNK_SECONDS = 3.0
+INTRO_START_FRAC = 0.10
+OUTRO_END_FRAC = 0.85
+
+
+def _clip_starts(duration: float, windows: int, win: float) -> np.ndarray:
+    # Skip intros/outros: sample evenly between 10% and 85% of the track.
+    return np.linspace(duration * INTRO_START_FRAC, duration * OUTRO_END_FRAC - win, windows)
+
+
+def _split_short(audio: np.ndarray, windows: int, win: float) -> list[np.ndarray]:
+    n = int(win * SAMPLE_RATE)
+    clips = [audio[i : i + n] for i in range(0, max(len(audio), 1), n)][:windows]
+    return [c for c in clips if len(c) >= SAMPLE_RATE] or [audio]
+
+
+def _ffmpeg_clips(path: Path, windows: int, win: float) -> tuple[list[np.ndarray], float]:
+    """Fallback for files libsndfile rejects (broken MP3 headers, odd containers)."""
+    out = subprocess.run(
+        ffmpeg_decode_cmd(path, "f32le"),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+    ).stdout
+    audio = np.frombuffer(out, dtype=np.float32)
+    duration = len(audio) / SAMPLE_RATE
+    if duration <= win * windows:
+        return _split_short(audio, windows, win), duration
+    n = int(win * SAMPLE_RATE)
+    starts = _clip_starts(duration, windows, win)
+    return [audio[int(s * SAMPLE_RATE) : int(s * SAMPLE_RATE) + n] for s in starts], duration
+
+
+def _librosa_clips(path: Path, windows: int, win: float) -> tuple[list[np.ndarray], float]:
+    import librosa
+
+    duration = float(librosa.get_duration(path=str(path)))
+    if duration <= win * windows:
+        audio, _ = librosa.load(str(path), sr=SAMPLE_RATE, mono=True, duration=win * windows)
+        return _split_short(audio, windows, win), duration
+
+    starts = _clip_starts(duration, windows, win)
+    clips: list[np.ndarray] = []
+    for start in starts:
+        audio, _ = librosa.load(
+            str(path), sr=SAMPLE_RATE, mono=True, offset=float(start), duration=win
+        )
+        if len(audio):
+            clips.append(audio)
+    return clips, duration
+
+
+def load_clips(path: Path, windows: int, window_seconds: float) -> tuple[list[np.ndarray], float]:
+    """Decode a few fixed-length mono clips spread across the track, plus its duration."""
+    try:
+        return _librosa_clips(path, windows, window_seconds)
+    except Exception:
+        if not shutil.which("ffmpeg"):
+            raise
+        return _ffmpeg_clips(path, windows, window_seconds)
+
+
+load_windows = load_clips
 
 
 def probe_duration(path: Path) -> float:
@@ -31,22 +94,48 @@ def rms_db(chunk: np.ndarray) -> float:
     return 20 * math.log10(max(rms, 1e-10))
 
 
+def ffmpeg_decode_cmd(path: Path, fmt: str = "f32le") -> list[str]:
+    return [
+        "ffmpeg",
+        "-nostdin",
+        "-v",
+        "error",
+        "-i",
+        str(path),
+        "-ac",
+        "1",
+        "-ar",
+        str(SAMPLE_RATE),
+        "-f",
+        fmt,
+        "-",
+    ]
+
+
+class _DecodeFailed(RuntimeError):
+    pass
+
+
 def _ffmpeg_stream(path: Path, n: int) -> Iterator[np.ndarray]:
     proc = subprocess.Popen(
-        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-ac", "1",
-         "-ar", str(SAMPLE_RATE), "-f", "f32le", "-"],
+        ffmpeg_decode_cmd(path, "f32le"),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
     assert proc.stdout is not None
+    eof = False
     try:
         while buf := proc.stdout.read(n * 4):
             yield np.frombuffer(buf, dtype=np.float32)
+        eof = True
     finally:
         proc.stdout.close()
-        proc.kill()
-        proc.wait()
+        if proc.poll() is None and not eof:
+            proc.kill()
+        rc = proc.wait()
+        if eof and rc != 0:
+            raise _DecodeFailed(f"ffmpeg exited with {rc}")
 
 
 def _librosa_full(path: Path) -> np.ndarray:
@@ -80,7 +169,10 @@ def dense_chunks(
     total = max(math.ceil(duration / window_seconds), 1) if duration else 0
     stride = max(math.ceil(total / max_chunks), 1) if total else 1
 
-    chunks, samples = _select(_ffmpeg_stream(path, n), stride)
+    try:
+        chunks, samples = _select(_ffmpeg_stream(path, n), stride)
+    except _DecodeFailed:
+        chunks, samples = [], 0
     if not chunks:
         # ffmpeg rejects some files libsndfile reads (e.g. WAV data behind an ID3 header).
         audio = _librosa_full(path)
@@ -141,22 +233,26 @@ def to_int16(audio: np.ndarray) -> np.ndarray:
 
 def _ffmpeg_s16(path: Path) -> np.ndarray:
     proc = subprocess.Popen(
-        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-ac", "1",
-         "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"],
+        ffmpeg_decode_cmd(path, "s16le"),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
     assert proc.stdout is not None
     blocks: list[np.ndarray] = []
+    eof = False
     try:
         while buf := proc.stdout.read(1 << 22):
             blocks.append(np.frombuffer(buf, dtype=np.int16))
+        eof = True
     finally:
         proc.stdout.close()
-        proc.kill()
-        proc.wait()
-    return np.concatenate(blocks) if blocks else np.zeros(0, dtype=np.int16)
+        if proc.poll() is None and not eof:
+            proc.kill()
+        rc = proc.wait()
+    if not eof or rc != 0 or not blocks:
+        return np.zeros(0, dtype=np.int16)
+    return np.concatenate(blocks)
 
 
 def sliding_chunks(

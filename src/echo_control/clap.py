@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import logging
-import shutil
-import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -10,69 +8,33 @@ from typing import Any, cast
 import numpy as np
 
 from .config import ModelConfig
-from .segments import Windows, dense_chunks, normalize, sliding_chunks, summarize
+from .segments import (
+    INTRO_START_FRAC,
+    OUTRO_END_FRAC,
+    SAMPLE_RATE,
+    Windows,
+    ffmpeg_decode_cmd,
+    load_clips,
+    load_windows,
+    normalize,
+)
+from .strategies import get_strategy
 
 log = logging.getLogger(__name__)
 
-SAMPLE_RATE = 48_000
-
-
-def _window_starts(duration: float, windows: int, win: float) -> np.ndarray:
-    # Skip intros/outros: sample evenly between 10% and 85% of the track.
-    return np.linspace(duration * 0.10, duration * 0.85 - win, windows)
-
-
-def _split_short(audio: np.ndarray, windows: int, win: float) -> list[np.ndarray]:
-    n = int(win * SAMPLE_RATE)
-    clips = [audio[i : i + n] for i in range(0, max(len(audio), 1), n)][:windows]
-    return [c for c in clips if len(c) >= SAMPLE_RATE] or [audio]
-
-
-def _ffmpeg_windows(path: Path, windows: int, win: float) -> tuple[list[np.ndarray], float]:
-    """Fallback for files libsndfile rejects (broken MP3 headers, odd containers)."""
-    out = subprocess.run(
-        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-ac", "1",
-         "-ar", str(SAMPLE_RATE), "-f", "f32le", "-"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        check=True,
-    ).stdout
-    audio = np.frombuffer(out, dtype=np.float32)
-    duration = len(audio) / SAMPLE_RATE
-    if duration <= win * windows:
-        return _split_short(audio, windows, win), duration
-    n = int(win * SAMPLE_RATE)
-    starts = _window_starts(duration, windows, win)
-    return [audio[int(s * SAMPLE_RATE) : int(s * SAMPLE_RATE) + n] for s in starts], duration
-
-
-def load_windows(path: Path, windows: int, window_seconds: float) -> tuple[list[np.ndarray], float]:
-    """Decode a few fixed-length mono clips spread across the track, plus its duration."""
-    try:
-        return _librosa_windows(path, windows, window_seconds)
-    except Exception:
-        if not shutil.which("ffmpeg"):
-            raise
-        return _ffmpeg_windows(path, windows, window_seconds)
-
-
-def _librosa_windows(path: Path, windows: int, win: float) -> tuple[list[np.ndarray], float]:
-    import librosa
-
-    duration = float(librosa.get_duration(path=str(path)))
-    if duration <= win * windows:
-        audio, _ = librosa.load(str(path), sr=SAMPLE_RATE, mono=True, duration=win * windows)
-        return _split_short(audio, windows, win), duration
-
-    starts = _window_starts(duration, windows, win)
-    clips: list[np.ndarray] = []
-    for start in starts:
-        audio, _ = librosa.load(
-            str(path), sr=SAMPLE_RATE, mono=True, offset=float(start), duration=win
-        )
-        if len(audio):
-            clips.append(audio)
-    return clips, duration
+__all__ = [
+    "INTRO_START_FRAC",
+    "OUTRO_END_FRAC",
+    "Clap",
+    "TextEncoder",
+    "ffmpeg_decode_cmd",
+    "load_clips",
+    "load_encoders",
+    "load_windows",
+    "prompt",
+    "resolve_devices",
+    "signature",
+]
 
 
 def resolve_devices(setting: str) -> list[str]:
@@ -93,17 +55,7 @@ def load_encoders(cfg: ModelConfig) -> list[Clap]:
 
 def signature(c: ModelConfig) -> str:
     """Identifies the embedding settings; tracks indexed under another one get redone."""
-    if c.strategy == "mean":
-        return f"{c.name}|mean|{c.windows}x{c.window_seconds:g}"
-    if c.strategy == "chunks":
-        return (
-            f"{c.name}|chunks|{c.window_seconds:g}|{c.hop_seconds:g}|{c.silence_db:g}"
-            f"|{c.edge_seconds:g}"
-        )
-    return (
-        f"{c.name}|clusters|{c.window_seconds:g}|{c.max_chunks}|{c.silence_db:g}"
-        f"|{c.max_clusters}|{c.min_cluster_share:g}|{c.merge_threshold:g}"
-    )
+    return get_strategy(c).signature(c)
 
 
 def prompt(cfg: ModelConfig, text: str) -> str:
@@ -159,7 +111,7 @@ class Clap:
 
         self.cfg: ModelConfig = cfg
         self.device: str = device or resolve_devices(cfg.device)[0]
-        self.lock: threading.Lock = threading.Lock()
+        self._lock: threading.RLock = threading.RLock()
         log.info("loading %s on %s", cfg.name, self.device)
         self.torch: Any = torch
         self.processor: ClapProcessor = ClapProcessor.from_pretrained(cfg.name)  # pyright: ignore[reportUnknownMemberType]
@@ -167,10 +119,22 @@ class Clap:
         self.dim: int = int(self.model.config.projection_dim)
         self._mel_fb: Any = None
         self._window: Any = None
+        if self._gpu_features_supported():
+            fe = self.processor.feature_extractor
+            self._mel_fb = self.torch.from_numpy(fe.mel_filters_slaney.astype(np.float32)).to(
+                self.device
+            )
+            self._window = self.torch.hann_window(
+                fe.fft_window_size, periodic=True, device=self.device
+            )
+
+    @property
+    def lock(self) -> Any:
+        return self._lock
 
     @staticmethod
     def _features(out: Any) -> np.ndarray:
-        # transformers >= 5 wraps projected embeddings in a model output
+        # Some transformers versions wrap projected embeddings in a model output object.
         tensor = out if hasattr(out, "cpu") else out.pooler_output
         return tensor.detach().float().cpu().numpy()
 
@@ -190,9 +154,6 @@ class Clap:
             if 0 < len(clip) < max_len:
                 clip = np.tile(clip, max_len // len(clip))
             batch[i, : len(clip)] = clip
-        if self._mel_fb is None:
-            self._mel_fb = torch.from_numpy(fe.mel_filters_slaney.astype(np.float32)).to(self.device)
-            self._window = torch.hann_window(fe.fft_window_size, periodic=True, device=self.device)
         x = torch.from_numpy(batch).to(self.device)
         spec = torch.stft(
             x,
@@ -220,17 +181,18 @@ class Clap:
             dtype=self.torch.bfloat16,
             enabled=self.device.startswith("cuda") and self.cfg.precision == "bf16",
         )
-        for i in range(0, len(clips), bs):
-            batch = clips[i : i + bs]
-            with self.torch.inference_mode(), autocast:
-                if gpu_features:
-                    inputs = self._log_mel(batch)
-                else:
-                    inputs = cast(Mapping[str, Any], self.processor(  # pyright: ignore[reportUnknownMemberType]
-                        audio=batch, sampling_rate=SAMPLE_RATE, return_tensors="pt"  # pyright: ignore[reportCallIssue]
-                    ).to(self.device))
-                emb = cast(object, self.model.get_audio_features(**inputs))  # pyright: ignore[reportUnknownMemberType]
-            out.append(self._features(emb))
+        with self._lock:
+            for i in range(0, len(clips), bs):
+                batch = clips[i : i + bs]
+                with self.torch.inference_mode(), autocast:
+                    if gpu_features:
+                        inputs = self._log_mel(batch)
+                    else:
+                        inputs = cast(Mapping[str, Any], self.processor(  # pyright: ignore[reportUnknownMemberType]
+                            audio=batch, sampling_rate=SAMPLE_RATE, return_tensors="pt"  # pyright: ignore[reportCallIssue]
+                        ).to(self.device))
+                    emb = cast(object, self.model.get_audio_features(**inputs))  # pyright: ignore[reportUnknownMemberType]
+                out.append(self._features(emb))
         return normalize(np.concatenate(out))
 
     @property
@@ -238,12 +200,7 @@ class Clap:
         return signature(self.cfg)
 
     def decode(self, path: Path) -> tuple[list[np.ndarray] | Windows, float]:
-        c = self.cfg
-        if c.strategy == "mean":
-            return load_windows(path, c.windows, c.window_seconds)
-        if c.strategy == "chunks":
-            return sliding_chunks(path, c.window_seconds, c.hop_seconds, c.silence_db)
-        return dense_chunks(path, c.window_seconds, c.max_chunks, c.silence_db)
+        return get_strategy(self.cfg).decode(path, self.cfg)
 
     def embed_windows(self, windows: Windows) -> np.ndarray:
         """One unit vector per window, in order. Windows are converted a batch at a time."""
@@ -254,16 +211,3 @@ class Clap:
             self.embed_clips([windows.clip(j) for j in range(i, min(i + bs, len(windows)))])
             for i in range(0, len(windows), bs)
         ])
-
-    def embed_decoded(self, clips: list[np.ndarray]) -> tuple[list[list[float]], list[float]]:
-        """Returns the track's vectors and the share of the track each one represents."""
-        if not clips:
-            raise ValueError("no decodable audio")
-        embs = self.embed_clips(clips)
-        c = self.cfg
-        if c.strategy == "mean":
-            return [normalize(embs.mean(axis=0)).tolist()], [1.0]
-        centroids, shares = summarize(
-            embs, c.max_clusters, c.min_cluster_share, c.merge_threshold
-        )
-        return centroids.tolist(), [round(float(s), 4) for s in shares]
