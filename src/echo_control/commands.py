@@ -15,7 +15,7 @@ from . import config as config_mod
 from .config import Config
 from .errors import EchoControlError, UsageError
 from .players import play, play_mpv_continuous
-from .store import ChunkStore, is_ready, open_store, wait_ready
+from .store import ChunkIndex, is_ready, open_store, wait_ready
 
 Notify = Callable[[str], None]
 
@@ -148,7 +148,7 @@ def run_vibe(
         seed = str(Path(req.seed).expanduser().resolve())
     else:
         assert vector is not None
-        hits = store.search(vector, 1 if req.wander else limit, cfg.search.share_weight)
+        hits = store.search(vector, 1 if req.wander else limit)
         if req.wander and not hits:
             raise EchoControlError("nothing matched to start wandering from")
         seed = hits[0].path if hits else ""
@@ -157,7 +157,7 @@ def run_vibe(
     if req.wander:
         from .wander import Orbit, walk, wander
 
-        assert isinstance(store, ChunkStore)
+        assert isinstance(store, ChunkIndex)
         found = store.track(seed)
         if found is None:
             raise EchoControlError(f"{seed} isn't in the chunk index")

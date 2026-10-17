@@ -7,7 +7,7 @@ import urllib.request
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 from qdrant_client import QdrantClient, models
@@ -25,6 +25,8 @@ class QdrantUnavailable(EchoControlError):
 
 
 UPSERT_BATCH = 256
+SCROLL_BATCH = 1000
+SEARCH_OVERFETCH = 3
 TRACK_VECTORS = ("mean", "intro", "outro", "intro_dir", "outro_dir")
 
 
@@ -49,21 +51,54 @@ class Candidate:
     """A possible next track: its payload, how close its intro is, and its vectors."""
 
     payload: dict[str, Any]
-    position: float
+    intro_sim: float
     intro_dir: np.ndarray | None
     mean: np.ndarray
     intro: np.ndarray
 
+    @property
+    def position(self) -> float:
+        return self.intro_sim
+
     @classmethod
-    def of(cls, payload: dict[str, Any], position: float, vectors: dict[str, Any]) -> Candidate:
+    def of(cls, payload: dict[str, Any], intro_sim: float, vectors: dict[str, Any]) -> Candidate:
         d = vectors.get("intro_dir")
         return cls(
             payload,
-            position,
+            intro_sim,
             None if d is None else np.asarray(d, np.float32),
             np.asarray(vectors["mean"], np.float32),
             np.asarray(vectors["intro"], np.float32),
         )
+
+
+@runtime_checkable
+class VectorIndex(Protocol):
+    def ensure(self, dim: int) -> None: ...
+    def drop(self) -> None: ...
+    def exists(self) -> bool: ...
+    def count(self) -> int: ...
+    def delete_paths(self, paths: list[str]) -> None: ...
+    def iter_payloads(self) -> Iterator[dict[str, Any]]: ...
+    def payloads(self, paths: list[str]) -> list[dict[str, Any]]: ...
+    def search(self, vector: list[float], limit: int) -> list[Hit]: ...
+
+
+@runtime_checkable
+class ChunkIndex(VectorIndex, Protocol):
+    def replace_track(
+        self,
+        path: str,
+        vectors: np.ndarray,
+        chunk_payloads: list[dict[str, Any]],
+        track_vectors: dict[str, Any],
+        track_payload: dict[str, Any],
+    ) -> None: ...
+    def track(self, path: str) -> tuple[dict[str, Any], dict[str, np.ndarray]] | None: ...
+    def chunk_vectors(self, path: str) -> np.ndarray: ...
+    def intros_near(self, vector: np.ndarray, limit: int, exclude: list[str]) -> list[Candidate]: ...
+    def intros_of(self, vector: np.ndarray, paths: list[str]) -> list[Candidate]: ...
+    def sustained(self, vector: list[float], paths: list[str]) -> dict[str, float]: ...
 
 
 def is_ready(url: str) -> bool:
@@ -88,7 +123,7 @@ def _iter_payloads(client: QdrantClient, collection: str) -> Iterator[dict[str, 
     offset = None
     while True:
         points, offset = client.scroll(
-            collection, limit=1000, offset=offset, with_payload=True, with_vectors=False
+            collection, limit=SCROLL_BATCH, offset=offset, with_payload=True, with_vectors=False
         )
         for p in points:
             yield p.payload or {}
@@ -105,12 +140,13 @@ def open_store(cfg: Config) -> Store | ChunkStore:
     if cfg.model.strategy == "chunks":
         sustain = max(1, round(cfg.search.sustain_seconds / cfg.model.hop_seconds))
         return ChunkStore(cfg.qdrant, sustain)
-    return Store(cfg.qdrant)
+    return Store(cfg.qdrant, share_weight=cfg.search.share_weight)
 
 
 class Store:
-    def __init__(self, cfg: QdrantConfig):
+    def __init__(self, cfg: QdrantConfig, share_weight: float = 0.0):
         self.cfg: QdrantConfig = cfg
+        self.share_weight: float = share_weight
         self.collection: str = cfg.collection
         self.client: QdrantClient = QdrantClient(url=cfg.url, timeout=30)
 
@@ -171,15 +207,16 @@ class Store:
     def payloads(self, paths: list[str]) -> list[dict[str, Any]]:
         return _payloads(self.client, self.collection, paths)
 
-    def search(self, vector: list[float], limit: int, share_weight: float = 0.0) -> list[Hit]:
+    def search(self, vector: list[float], limit: int, share_weight: float | None = None) -> list[Hit]:
         """MaxSim over each track's vectors. With share_weight > 0, candidates are re-ranked
         by max(similarity * share ** share_weight), so a vector covering a sliver of a track
         (a bridge, one section of a DJ mix) counts for less than one covering most of it."""
-        rerank = share_weight > 0
+        weight = self.share_weight if share_weight is None else share_weight
+        rerank = weight > 0
         res = self.client.query_points(
             self.collection,
             query=[vector],
-            limit=limit * 3 if rerank else limit,
+            limit=limit * SEARCH_OVERFETCH if rerank else limit,
             with_payload=True,
             with_vectors=rerank,
         )
@@ -192,7 +229,7 @@ class Store:
                 sims = np.asarray(p.vector, dtype=np.float32) @ q
                 shares = np.asarray(pl.get("shares") or [1.0] * len(sims))
                 if len(shares) == len(sims):
-                    score = float(np.max(sims * shares**share_weight))
+                    score = float(np.max(sims * shares**weight))
             hits.append(Hit(path=str(pl.get("path", "")), score=score, duration=pl.get("duration")))
         if rerank:
             hits.sort(key=lambda h: -h.score)
@@ -336,17 +373,41 @@ class ChunkStore:
 
     def chunk_vectors(self, path: str) -> np.ndarray:
         """The track's window vectors in time order."""
-        points, _ = self.client.scroll(
-            self.chunks,
-            scroll_filter=models.Filter(
-                must=[models.FieldCondition(key="path", match=models.MatchValue(value=path))]
-            ),
-            limit=1_000_000,
-            with_payload=["idx"],
-            with_vectors=True,
+        all_points: list[models.Record] = []
+        offset = None
+        filt = models.Filter(
+            must=[models.FieldCondition(key="path", match=models.MatchValue(value=path))]
         )
-        points.sort(key=lambda p: (p.payload or {}).get("idx", 0))
-        return np.array([p.vector for p in points], dtype=np.float32)
+        while True:
+            points, offset = self.client.scroll(
+                self.chunks,
+                scroll_filter=filt,
+                limit=SCROLL_BATCH,
+                offset=offset,
+                with_payload=["idx"],
+                with_vectors=True,
+            )
+            all_points.extend(points)
+            if offset is None:
+                break
+        all_points.sort(key=lambda p: (p.payload or {}).get("idx", 0))
+        return np.array([p.vector for p in all_points], dtype=np.float32)
+
+    @staticmethod
+    def _to_candidates(
+        points: list[models.ScoredPoint] | list[models.Record],
+        ref_vector: np.ndarray,
+    ) -> list[Candidate]:
+        out: list[Candidate] = []
+        for p in points:
+            if isinstance(p.vector, dict):
+                sim = (
+                    p.score
+                    if isinstance(p, models.ScoredPoint)
+                    else float(np.asarray(p.vector["intro"], np.float32) @ ref_vector)
+                )
+                out.append(Candidate.of(p.payload or {}, sim, p.vector))
+        return out
 
     def intros_near(self, vector: np.ndarray, limit: int, exclude: list[str]) -> list[Candidate]:
         """Audible tracks whose intro is closest to vector."""
@@ -364,11 +425,7 @@ class ChunkStore:
             with_payload=True,
             with_vectors=["intro", "intro_dir", "mean"],
         )
-        out: list[Candidate] = []
-        for p in res.points:
-            if isinstance(p.vector, dict):
-                out.append(Candidate.of(p.payload or {}, p.score, p.vector))
-        return out
+        return self._to_candidates(res.points, vector)
 
     def intros_of(self, vector: np.ndarray, paths: list[str]) -> list[Candidate]:
         """Like intros_near, for the given tracks rather than the nearest ones."""
@@ -378,13 +435,7 @@ class ChunkStore:
             with_payload=True,
             with_vectors=["intro", "intro_dir", "mean"],
         )
-        out: list[Candidate] = []
-        for p in points:
-            if isinstance(p.vector, dict):
-                out.append(Candidate.of(
-                    p.payload or {}, float(np.asarray(p.vector["intro"], np.float32) @ vector), p.vector
-                ))
-        return out
+        return self._to_candidates(points, vector)
 
     def sustained(self, vector: list[float], paths: list[str]) -> dict[str, float]:
         """search()'s score for each of the given tracks; tracks with no loud windows are left out."""
@@ -418,12 +469,11 @@ class ChunkStore:
             for g in res.groups
         ]
 
-    def search(self, vector: list[float], limit: int, _share_weight: float = 0.0) -> list[Hit]:
+    def search(self, vector: list[float], limit: int) -> list[Hit]:
         """Tracks ranked by the mean similarity of their best sustain_windows non-silent
         windows, so a track has to hold the vibe for a while rather than for one lucky
         moment. Tracks with fewer windows are averaged over all of them. Candidates come from
-        each track's single best window, over-fetched to leave room for the re-rank.
-        share_weight doesn't apply."""
-        hits = self._groups(vector, limit * 3 if self.sustain_windows > 1 else limit)
+        each track's single best window, over-fetched to leave room for the re-rank."""
+        hits = self._groups(vector, limit * SEARCH_OVERFETCH if self.sustain_windows > 1 else limit)
         hits.sort(key=lambda h: -h.score)
         return hits[:limit]

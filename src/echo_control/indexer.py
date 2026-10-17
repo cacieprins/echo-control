@@ -15,6 +15,13 @@ import numpy as np
 from . import trajectory
 from .clap import Clap
 from .config import Config
+from .records import (
+    ScanKey,
+    ScanStats,
+    chunk_payload,
+    chunk_track_payload,
+    multivector_payload,
+)
 from .segments import Windows, normalize
 from .store import ChunkStore, Store
 
@@ -22,7 +29,7 @@ log = logging.getLogger(__name__)
 
 DECODE_WORKERS = 4
 
-Key = tuple[float | None, int | None, str | None]
+Key = ScanKey
 Decoded = tuple[list[np.ndarray] | Windows, float]
 StopFlag = threading.Event | ProcessEvent
 
@@ -55,16 +62,16 @@ def is_audio(path: Path, cfg: Config) -> bool:
     )
 
 
-def state_key(payload: dict[str, Any]) -> Key:
-    return (payload.get("mtime"), payload.get("size"), payload.get("embedding"))
+def state_key(payload: dict[str, Any]) -> ScanKey:
+    return ScanKey(payload.get("mtime"), payload.get("size"), payload.get("embedding"))
 
 
-def current_key(path: Path, signature: str) -> Key | None:
+def current_key(path: Path, signature: str) -> ScanKey | None:
     try:
         st = path.stat()
     except OSError:
         return None
-    return (st.st_mtime, st.st_size, signature)
+    return ScanKey(st.st_mtime, st.st_size, signature)
 
 
 class Indexer:
@@ -75,13 +82,13 @@ class Indexer:
         self.store: Store | ChunkStore = store
         store.ensure(self.clap.dim)
 
-    def current_key(self, path: Path) -> Key | None:
+    def current_key(self, path: Path) -> ScanKey | None:
         return current_key(path, self.clap.signature)
 
     def index_file(
         self,
         path: Path,
-        known: dict[str, Key] | None = None,
+        known: dict[str, ScanKey] | None = None,
         decoded: Future[Decoded] | None = None,
         encoder: Clap | None = None,
     ) -> bool:
@@ -115,14 +122,7 @@ class Indexer:
         self.store.upsert(
             key,
             vectors,
-            {
-                "path": key,
-                "mtime": st.st_mtime,
-                "size": st.st_size,
-                "duration": duration,
-                "shares": shares,
-                "embedding": self.clap.signature,
-            },
+            multivector_payload(key, st, duration, shares, self.clap.signature),
         )
         return True
 
@@ -133,16 +133,16 @@ class Indexer:
         starts = np.array([s for s, _ in spans])
         speed = trajectory.speeds(vectors, starts)
         chunk_payloads = [
-            {
-                "path": key,
-                "idx": i,
-                "total": len(windows),
-                "start": round(start, 3),
-                "end": round(end, 3),
-                "db": round(windows.db[i], 2),
-                "silent": windows.silent[i],
-                "speed": None if np.isnan(speed[i]) else round(float(speed[i]), 5),
-            }
+            chunk_payload(
+                path=key,
+                idx=i,
+                total=len(windows),
+                start=start,
+                end=end,
+                db=windows.db[i],
+                silent=windows.silent[i],
+                speed=None if np.isnan(speed[i]) else float(speed[i]),
+            )
             for i, (start, end) in enumerate(spans)
         ]
         loud = ~np.array(windows.silent)
@@ -161,24 +161,25 @@ class Indexer:
             vectors,
             chunk_payloads,
             track_vectors,
-            {
-                "intro_drift": round(intro.drift, 6),
-                "outro_drift": round(outro.drift, 6),
-                "path": key,
-                "mtime": st.st_mtime,
-                "size": st.st_size,
-                "duration": duration,
-                "embedding": self.clap.signature,
-                "n_chunks": len(windows),
-                "silent": not loud.any(),
-                **trajectory.summarize(vectors, starts, self.cfg.model.window_seconds),
-            },
+            chunk_track_payload(
+                path=key,
+                st=st,
+                duration=duration,
+                signature=self.clap.signature,
+                n_chunks=len(windows),
+                silent=not loud.any(),
+                intro_drift=intro.drift,
+                outro_drift=outro.drift,
+                trajectory_summary=trajectory.summarize(
+                    vectors, starts, self.cfg.model.window_seconds
+                ),
+            ),
         )
 
     def remove(self, paths: Iterable[Path]) -> None:
         self.store.delete_paths([str(p) for p in paths])
 
-    def scan(self, stop: StopFlag | None = None) -> tuple[int, int, int]:
+    def scan(self, stop: StopFlag | None = None) -> ScanStats:
         """Full pass: index new/changed files, prune missing ones."""
         known = {p["path"]: state_key(p) for p in self.store.iter_payloads() if "path" in p}
         lib = self.cfg.library
@@ -193,7 +194,7 @@ class Indexer:
         self.store.delete_paths(missing)
         if missing:
             log.info("pruned %d missing files", len(missing))
-        return len(files), added, len(missing)
+        return ScanStats(len(files), added, len(missing))
 
     def index_many(self, todo: list[Path], stop: StopFlag | None = None) -> int:
         """Decode on a thread pool and embed on one worker thread per encoder (GPU)."""

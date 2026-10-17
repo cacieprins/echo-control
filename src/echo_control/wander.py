@@ -14,7 +14,7 @@ import numpy as np
 
 from . import trajectory
 from .config import WanderConfig
-from .store import Candidate, ChunkStore
+from .store import Candidate, ChunkIndex
 
 DRIFT_EPS = 1e-4
 
@@ -23,12 +23,16 @@ DRIFT_EPS = 1e-4
 class Transition:
     path: str
     score: float
-    position: float
+    intro_sim: float
     direction: float
     drift: float
     center: float = 0.0
     mean: np.ndarray | None = field(default=None, repr=False)
     intro: np.ndarray | None = field(default=None, repr=False)
+
+    @property
+    def position(self) -> float:
+        return self.intro_sim
 
 
 @dataclass
@@ -49,8 +53,8 @@ class Duplicates:
     files) line up window for window, while similar tracks from one album only match on
     average. Window vectors are fetched once per track and cached for the walk."""
 
-    def __init__(self, store: ChunkStore, cfg: WanderConfig):
-        self.store: ChunkStore = store
+    def __init__(self, store: ChunkIndex, cfg: WanderConfig):
+        self.store: ChunkIndex = store
         self.cfg: WanderConfig = cfg
         self.windows: dict[str, np.ndarray] = {}
 
@@ -75,7 +79,7 @@ class Duplicates:
 
 
 def rank_next(
-    store: ChunkStore,
+    store: ChunkIndex,
     played: list[Transition],
     cfg: WanderConfig,
     orbit: Orbit | None = None,
@@ -113,18 +117,18 @@ def rank_next(
         )
         drift = drift_match(outro_drift, float(c.payload.get("intro_drift") or 0.0))
         center = near_center.get(c.payload["path"], 0.0)
-        score = cfg.position * c.position + cfg.direction * direction + cfg.drift * drift
+        score = cfg.position * c.intro_sim + cfg.direction * direction + cfg.drift * drift
         if orbit:
             score += orbit.strength * center
         out.append(Transition(
-            c.payload["path"], score, c.position, direction, drift, center, c.mean, c.intro,
+            c.payload["path"], score, c.intro_sim, direction, drift, center, c.mean, c.intro,
         ))
     out.sort(key=lambda t: -t.score)
     return out
 
 
 def walk(
-    store: ChunkStore, seed: str, cfg: WanderConfig, orbit: Orbit | None = None
+    store: ChunkIndex, seed: str, cfg: WanderConfig, orbit: Orbit | None = None
 ) -> Iterator[Transition]:
     """Greedy walk from seed, one step at a time, until nothing unplayed is left; the seed
     comes first, with a score of 0."""
@@ -141,6 +145,6 @@ def walk(
 
 
 def wander(
-    store: ChunkStore, seed: str, length: int, cfg: WanderConfig, orbit: Orbit | None = None
+    store: ChunkIndex, seed: str, length: int, cfg: WanderConfig, orbit: Orbit | None = None
 ) -> list[Transition]:
     return list(itertools.islice(walk(store, seed, cfg, orbit), length))

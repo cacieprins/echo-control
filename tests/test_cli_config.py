@@ -539,3 +539,76 @@ def test_commands_format_status() -> None:
     assert "pending: 3 changed files" in text_running
 
 
+def test_records_and_index_protocols() -> None:
+    import os
+    from types import SimpleNamespace
+    from typing import Any
+
+    import numpy as np
+
+    from echo_control.config import QdrantConfig
+    from echo_control.indexer import state_key
+    from echo_control.records import (
+        ScanKey,
+        ScanStats,
+        chunk_payload,
+        chunk_track_payload,
+        multivector_payload,
+    )
+    from echo_control.store import Candidate, ChunkIndex, ChunkStore, Store, VectorIndex
+
+    st = os.stat_result((0o644, 1, 1, 1, 1000, 1000, 4096, 10.0, 20.0, 30.0))
+    mv_pl = multivector_payload("/a.mp3", st, 120.5, [0.6, 0.4], "sig1")
+    assert state_key(mv_pl) == ScanKey(20.0, 4096, "sig1")
+    assert mv_pl["shares"] == [0.6, 0.4]
+
+    cp = chunk_payload("/a.mp3", 2, 10, 5.0004, 15.0004, -12.345, False, 0.123456)
+    assert cp == {
+        "path": "/a.mp3",
+        "idx": 2,
+        "total": 10,
+        "start": 5.0,
+        "end": 15.0,
+        "db": -12.35,
+        "silent": False,
+        "speed": 0.12346,
+    }
+
+    tp = chunk_track_payload("/a.mp3", st, 120.5, "sig1", 10, False, 0.1, 0.2, {"spikes": 2})
+    assert state_key(tp) == ScanKey(20.0, 4096, "sig1")
+    assert tp["n_chunks"] == 10 and tp["spikes"] == 2
+
+    stats = ScanStats(10, 3, 1)
+    total, indexed, removed = stats
+    assert (total, indexed, removed) == (10, 3, 1)
+
+    s = Store.__new__(Store)
+    cs = ChunkStore.__new__(ChunkStore)
+    assert isinstance(s, VectorIndex)
+    assert isinstance(cs, VectorIndex)
+    assert isinstance(cs, ChunkIndex)
+
+    cand = Candidate.of(
+        {"path": "/a.mp3"},
+        0.75,
+        {"mean": [1.0, 0.0], "intro": [0.0, 1.0], "intro_dir": [1.0, 0.0]},
+    )
+    assert cand.intro_sim == 0.75
+    assert cand.position == 0.75
+
+    # Verify chunk_vectors paginates across multiple scroll batches and sorts by idx
+    cs.cfg = QdrantConfig(collection="col")
+    cs.chunks = "col_chunks"
+
+    class PaginatingClient:
+        def scroll(self, *_a: Any, offset: int | None = None, **_kw: Any) -> tuple[list[Any], int | None]:
+            if offset is None:
+                return [SimpleNamespace(payload={"idx": 1}, vector=[0.0, 1.0])], 1
+            return [SimpleNamespace(payload={"idx": 0}, vector=[1.0, 0.0])], None
+
+    cs.client = PaginatingClient()  # pyright: ignore[reportAttributeAccessIssue]
+    vecs = cs.chunk_vectors("/a.mp3")
+    assert np.allclose(vecs, np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32))
+
+
+

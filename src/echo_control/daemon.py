@@ -20,8 +20,9 @@ from watchdog.observers import Observer
 
 from .clap import TextEncoder, signature
 from .config import Config, socket_path
-from .indexer import Key, current_key, is_audio, state_key
-from .store import ChunkStore, Store, open_store, wait_ready
+from .indexer import current_key, is_audio, state_key
+from .records import ScanKey, ScanStats
+from .store import VectorIndex, open_store, wait_ready
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +41,7 @@ def _index_job(
     cfg: Config,
     paths: list[str] | None,
     stop: Event,
-    conn: Connection[tuple[int, int, int] | int, object],
+    conn: Connection[ScanStats | int, object],
 ) -> None:
     """Runs in a spawned child: loads the GPU encoders, indexes, and exits, which is the
     only way to get rid of ROCm's spinning runtime thread once the GPU has been used."""
@@ -102,7 +103,7 @@ class Daemon:
 
         wait_ready(cfg.qdrant.url, cfg.qdrant.ready_timeout)
         self.text: TextEncoder = TextEncoder(cfg.model)
-        self.store: Store | ChunkStore = open_store(cfg)
+        self.store: VectorIndex = open_store(cfg)
         self.store.ensure(self.text.dim)
 
     def _run_job(self, paths: list[Path] | None) -> Any:
@@ -182,7 +183,7 @@ class Daemon:
                 if added is not None:
                     log.info("indexed %d of %d changed files", added, len(changed))
 
-    def _known(self, paths: list[Path]) -> dict[str, Key]:
+    def _known(self, paths: list[Path]) -> dict[str, ScanKey]:
         payloads = self.store.payloads([str(p) for p in paths])
         return {pl["path"]: state_key(pl) for pl in payloads}
 
