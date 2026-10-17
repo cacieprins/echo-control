@@ -15,10 +15,6 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    env:
-      # The locked torch is the multi-GB ROCm build; CI swaps in the CPU build of the same
-      # version, and `uv run` must not sync it back.
-      UV_NO_SYNC: "1"
     services:
       qdrant:
         image: qdrant/qdrant:v1.19.1
@@ -33,12 +29,10 @@ jobs:
           cache-dependency-glob: uv.lock
 
       - name: Install dependencies
-        run: |
-          uv sync --frozen --no-install-package torch --no-install-package triton-rocm
-          uv pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
+        run: uv sync --frozen --extra cpu
 
       - name: ruff and basedpyright
-        run: uv run pre-commit run --all-files
+        run: uv run --no-sync pre-commit run --all-files
 
       - name: Wait for Qdrant
         run: |
@@ -50,4 +44,4 @@ jobs:
           exit 1
 
       - name: pytest
-        run: uv run pytest
+        run: uv run --no-sync pytest

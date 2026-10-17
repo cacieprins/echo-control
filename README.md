@@ -4,10 +4,11 @@ Walk a local music library along smooth trajectories in audio embedding space.
 
 Every track is sliced into overlapping windows, embedded with
 [CLAP](https://huggingface.co/laion/larger_clap_music_and_speech)'s audio tower, and stored in
-Qdrant along with its intro and outro positions, headings, and drift rates. Starting from a seed
-track (`--from`), `vibe` chains tracks whose intro picks up where the previous outro left off—matching
-seam position, direction of movement, and pace. With `--orbit`, the walk is pulled back toward the
-seed so it circles a vibe instead of drifting off into the weeds.
+Qdrant along with its intro and outro positions, headings, and drift rates.
+
+Starting from a seed track (`--from`), `vibe` chains tracks whose intro picks up where the previous
+outro left off—matching seam position, direction of movement, and pace. With `--orbit`, the walk
+is pulled back toward the seed so it circles a vibe instead of drifting off into the sunset.
 
 ```bash
 # Walk 25 tracks from a seed file, matching outro -> intro transitions
@@ -22,16 +23,17 @@ vibe --continuous --orbit=1.5 --from ~/Music/album/opener.flac
 
 Tags and metadata are never read; transitions and similarity come purely from how the audio moves
 through embedding space. You can also pass a text query instead of `--from` to pick an initial seed
-or orbit center (e.g. `vibe --orbit "sad synth"`), though CLAP's language model is pretty weak—it's
-fine for picking a rough starting point, but audio-to-audio trajectory matching is where this
-actually shines.
+or orbit center (e.g. `vibe --orbit "sad synth"`), though CLAP's language model is pretty weak. CLAP's
+model lends more towards description ("[sounds like] acoustic guitar, in a minor key"), rather than vibe.
+
+It's fine for picking a rough starting point, but audio-to-audio trajectory matching produces much more
+compelling results.
 
 ### Example Walk
 
 Starting an orbit (`--orbit=1.0`) from Hybrid's *Steal You Away* (`Morning Sci-Fi`, 2003) jumps
 across 70s synth-rock (*Quadrophenia*), Bristol trip-hop, progressive breaks, world-fusion, and
-prog metal—stuff you probably wouldn't think to put on the same playlist, but the seams lock right
-in:
+prog metal: stuff you probably wouldn't think to put on the same playlist, but it *works*.
 
 ```bash
 vibe --orbit -n 10 --from ~/Music/"Hybrid/Morning Sci-Fi/09 Steal You Away.mp3"
@@ -57,15 +59,17 @@ vibe --orbit -n 10 --from ~/Music/"Hybrid/Morning Sci-Fi/09 Steal You Away.mp3"
   pace `drift = -0.09`). At the end, *Tulku*'s *Anni Rose* flows into the rain-and-clean-guitar
   intro of Dream Theater's *Trial of Tears* with an exact pace match (`drift = -0.00`) and aligned
   heading (`dir = +0.39`).
-- **Album gravity (`3 -> 4 -> 5`):** Once *The Rock* lands on *Portishead – Sour Times* (pulled in
+- **Album gravity (`3 -> 4 -> 5`):** After *The Rock*, it lands on *Portishead – Sour Times* (pulled in
   by a `+0.86` orbit match to the seed), *Dummy*'s dusty vinyl/vocal mastering is so cohesive that
   three tracks chain in a row (`+0.80` into *Glory Box*, `+0.77` into *It Could Be Sweet*) before
   *It Could Be Sweet*'s outro bridges out to *Sneaker Pimps* and *BT*.
 
 ## Setup
 
+Pick the PyTorch backend for your hardware (`rocm`, `cuda`, or `cpu`):
+
 ```bash
-uv tool install --editable .          # installs `vibe` and `echo-control` into ~/.local/bin
+uv tool install --editable ".[rocm]"  # or ".[cuda]" / ".[cpu]"; installs `vibe` and `echo-control`
 echo-control install-service          # writes config.toml, docker-compose + systemd user units
 # edit ~/.config/echo-control/config.toml to set [library] paths
 systemctl --user enable --now echo-control
@@ -73,7 +77,23 @@ echo-control status
 ```
 
 Requires Docker (system `docker.service` enabled, user in the `docker` group).
-The first scan is slow on CPU; watch it with `journalctl --user -fu echo-control`.
+Watch indexing progress with `journalctl --user -fu echo-control`.
+
+### GPU Acceleration
+
+Indexing with the `chunks` strategy embeds every 2.5s hop of every track, which is painfully slow on
+CPU. Use a GPU if you have one. With `device = "auto"` (the default) and `precision = "bf16"` (~4×
+faster than `fp32`), `echo-control` will automatically fan out across every available GPU (or you
+can pin specific cards with e.g. `device = "cuda:0,cuda:1"` in `config.toml`):
+
+- **AMD (`".[rocm]"`):** Pulls `torch` and `triton-rocm` from PyTorch's ROCm 7.2 index (ROCm devices
+  report as `cuda` to PyTorch).
+- **NVIDIA (`".[cuda]"`):** Pulls `torch` from PyTorch's CUDA 12.6 index (`cu126`).
+- **CPU-only (`".[cpu]"`):** Pulls the CPU-only `torch` build. Consider setting `strategy = "clusters"`
+  or `"mean"` in `config.toml` so scans don't take all day.
+
+> [!NOTE]
+> Non-AMD setups (`".[cuda]"` and `".[cpu]"`) are currently untested.
 
 ## Wandering & Orbiting (`[wander]`)
 
@@ -191,9 +211,9 @@ flagged under `chunks` so window positions stay evenly spaced).
 `echo-control install-noctalia` registers `contrib/noctalia` as a local plugin source and enables
 `case/vibe`. In the launcher, type `/vibe <query>`.
 
-## GPU
+## License
 
-`torch` is pulled from PyTorch's ROCm 7.2 index (see `[tool.uv.sources]` in `pyproject.toml`), so
-AMD GPUs work out of the box with `device = "auto"` (ROCm reports as `cuda`). `triton-rocm` is a
-direct dependency because `uv` only applies custom indexes to direct dependencies. For CPU-only
-machines, point the index at `https://download.pytorch.org/whl/cpu` and drop `triton-rocm`.
+Copyright (C) 2026 Cacie Prins
+
+[AGPL-3.0-or-later](LICENSE). You can use, modify, and share it, but if you distribute a modified
+version or run one as a network service, you have to release your source under the same license.

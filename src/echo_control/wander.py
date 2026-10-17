@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Cacie Prins
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Chain tracks so each one picks up where the last left off in embedding space: the next
 track's intro should sit near the previous outro, head the same way, and move at a similar
 pace. Orbiting adds a pull toward a fixed center (the query, or the seed track), so the walk
