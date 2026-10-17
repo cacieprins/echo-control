@@ -6,26 +6,46 @@ import numpy as np
 import pytest
 
 from echo_control.config import QdrantConfig
-from echo_control.store import ChunkStore, is_ready
+from echo_control.store import ChunkIndex, ChunkStore, VectorIndex, is_ready
+from tests.fakes import InMemoryChunkIndex, InMemoryVectorIndex
 
 URL = "http://localhost:6333"
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not is_ready(URL), reason="no Qdrant on localhost:6333"),
-]
+
+@pytest.fixture(
+    params=[
+        pytest.param("memory", id="memory"),
+        pytest.param(
+            "qdrant",
+            id="qdrant",
+            marks=[
+                pytest.mark.integration,
+                pytest.mark.skipif(not is_ready(URL), reason="no Qdrant on localhost:6333"),
+            ],
+        ),
+    ]
+)
+def store(request: pytest.FixtureRequest) -> Iterator[ChunkStore | InMemoryChunkIndex]:
+    if request.param == "memory":
+        mem = InMemoryChunkIndex()
+        mem.ensure(8)
+        yield mem
+        mem.drop()
+    else:
+        s = ChunkStore(QdrantConfig(url=URL, collection=f"test_{uuid.uuid4().hex[:8]}"))
+        s.ensure(8)
+        yield s
+        s.drop()
 
 
-@pytest.fixture
-def store() -> Iterator[ChunkStore]:
-    s = ChunkStore(QdrantConfig(url=URL, collection=f"test_{uuid.uuid4().hex[:8]}"))
-    s.ensure(8)
-    yield s
-    s.drop()
+def _chunk_count(store: ChunkStore | InMemoryChunkIndex) -> int:
+    if isinstance(store, ChunkStore):
+        return store.client.count(store.chunks, exact=True).count
+    return store.chunk_count()
 
 
 def _put(
-    store: ChunkStore,
+    store: ChunkIndex,
     path: str,
     vecs: np.ndarray,
     silent: list[bool] | None = None,
@@ -45,7 +65,37 @@ def _put(
     )
 
 
-def test_wander_follows_outros_into_intros(store: ChunkStore) -> None:
+def test_in_memory_fakes_satisfy_protocols() -> None:
+    vec_idx = InMemoryVectorIndex(share_weight=0.5)
+    chunk_idx = InMemoryChunkIndex()
+    assert isinstance(vec_idx, VectorIndex)
+    assert isinstance(chunk_idx, VectorIndex)
+    assert isinstance(chunk_idx, ChunkIndex)
+
+    vec_idx.ensure(4)
+    assert vec_idx.exists()
+    vec_idx.upsert(
+        "/x",
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+        {"path": "/x", "duration": 12.0, "shares": [0.1, 0.9]},
+    )
+    vec_idx.upsert(
+        "/y",
+        [[0.8, 0.0, 0.0, 0.0]],
+        {"path": "/y", "duration": 10.0, "shares": [1.0]},
+    )
+    assert vec_idx.count() == 2
+    assert [p["path"] for p in vec_idx.payloads(["/x", "/missing"])] == ["/x"]
+    # Without share_weight, /x (1.0) beats /y (0.8); with share_weight=0.5, /y (0.8 * 1.0) beats /x (1.0 * sqrt(0.1) = 0.316).
+    assert vec_idx.search([1.0, 0.0, 0.0, 0.0], 2, share_weight=0.0)[0].path == "/x"
+    assert vec_idx.search([1.0, 0.0, 0.0, 0.0], 2)[0].path == "/y"
+    vec_idx.delete_paths(["/x"])
+    assert vec_idx.count() == 1
+    vec_idx.drop()
+    assert not vec_idx.exists() and vec_idx.count() == 0
+
+
+def test_wander_follows_outros_into_intros(store: ChunkStore | InMemoryChunkIndex) -> None:
     from echo_control.config import WanderConfig
     from echo_control.wander import wander
 
@@ -57,10 +107,11 @@ def test_wander_follows_outros_into_intros(store: ChunkStore) -> None:
     _put(store, "/d", eye[[7]], intro=eye[3].tolist(), outro=eye[3].tolist())
     chain = wander(store, "/a", 4, WanderConfig())
     assert [t.path for t in chain] == ["/a", "/b", "/c", "/d"]
+    assert chain[1].intro_sim > 0.99
     assert chain[1].position > 0.99
 
 
-def test_wander_skips_duplicates_and_silent_tracks(store: ChunkStore) -> None:
+def test_wander_skips_duplicates_and_silent_tracks(store: ChunkStore | InMemoryChunkIndex) -> None:
     from echo_control.config import WanderConfig
     from echo_control.wander import wander
 
@@ -80,7 +131,7 @@ def test_wander_skips_duplicates_and_silent_tracks(store: ChunkStore) -> None:
     assert [t.path for t in chain] == ["/a", "/same-album", "/b"]
 
 
-def test_search_groups_by_track_and_skips_silence(store: ChunkStore) -> None:
+def test_search_groups_by_track_and_skips_silence(store: ChunkStore | InMemoryChunkIndex) -> None:
     eye = np.eye(8, dtype=np.float32)
     _put(store, "/a", eye[[0, 1, 2]])
     _put(store, "/b", eye[[3, 4]], silent=[False, True])
@@ -91,7 +142,7 @@ def test_search_groups_by_track_and_skips_silence(store: ChunkStore) -> None:
     assert len({h.path for h in hits}) == len(hits)
 
 
-def test_orbit_pulls_back_toward_the_center(store: ChunkStore) -> None:
+def test_orbit_pulls_back_toward_the_center(store: ChunkStore | InMemoryChunkIndex) -> None:
     from echo_control.config import WanderConfig
     from echo_control.wander import Orbit, wander
 
@@ -109,7 +160,7 @@ def test_orbit_pulls_back_toward_the_center(store: ChunkStore) -> None:
     assert chain[1].center > 0.99
 
 
-def test_sustained_match_beats_one_lucky_window(store: ChunkStore) -> None:
+def test_sustained_match_beats_one_lucky_window(store: ChunkStore | InMemoryChunkIndex) -> None:
     q = np.eye(8, dtype=np.float32)[0]
     other = np.eye(8, dtype=np.float32)[1]
     near = (0.8 * q + 0.6 * other)[None]
@@ -123,12 +174,12 @@ def test_sustained_match_beats_one_lucky_window(store: ChunkStore) -> None:
     assert abs(hits[0].score - 0.8) < 0.02 and abs(hits[1].score - 0.25) < 0.02
 
 
-def test_replace_shrinks_and_delete_removes(store: ChunkStore) -> None:
+def test_replace_shrinks_and_delete_removes(store: ChunkStore | InMemoryChunkIndex) -> None:
     eye = np.eye(8, dtype=np.float32)
     _put(store, "/a", eye[[0, 1, 2]])
     _put(store, "/a", eye[[5]])
-    assert store.client.count(store.chunks, exact=True).count == 1
+    assert _chunk_count(store) == 1
     assert [p["n"] for p in store.payloads(["/a", "/missing"])] == [1]
     store.delete_paths(["/a"])
     assert store.count() == 0
-    assert store.client.count(store.chunks, exact=True).count == 0
+    assert _chunk_count(store) == 0

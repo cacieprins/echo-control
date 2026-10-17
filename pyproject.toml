@@ -45,6 +45,7 @@ reportExplicitAny = false
 reportUnusedCallResult = false
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 markers = [
     "integration: tests requiring a running Qdrant server on localhost:6333",
 ]
