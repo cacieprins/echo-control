@@ -10,7 +10,10 @@ from echo_control.store import ChunkStore, is_ready
 
 URL = "http://localhost:6333"
 
-pytestmark = pytest.mark.skipif(not is_ready(URL), reason="no Qdrant on localhost:6333")
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(not is_ready(URL), reason="no Qdrant on localhost:6333"),
+]
 
 
 @pytest.fixture
