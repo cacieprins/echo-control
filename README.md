@@ -234,3 +234,5 @@ Copyright (C) 2026 Cacie Prins
 
 [AGPL-3.0-or-later](LICENSE). You can use, modify, and share it, but if you distribute a modified
 version or run one as a network service, you have to release your source under the same license.
+
+This project was built with the assistance of LLMs.
