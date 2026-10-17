@@ -14,14 +14,15 @@ precision = "bf16"     # bf16 | fp32 for audio on GPU; bf16 is ~4x faster (fp16 
 batch_size = 8
 window_seconds = 10.0
 # How a track becomes vectors. Changing any of these re-embeds the library on the next scan.
+#   chunks:   store every window_seconds window, every hop_seconds, as its own point with its
+#             position, loudness and speed through embedding space, in <collection>_chunks
+#             and <collection>_tracks (required for --wander, --orbit, --continuous).
+#             Uncapped: ~4x the embedding work of clusters for typical tracks, far more for
+#             long mixes. max_* and merge_* don't apply.
 #   clusters: embed every window_seconds chunk, k-means them, store up to max_clusters
 #             centroids per track; a query matches a track's best section.
 #   mean:     average `windows` evenly spaced clips into a single vector (faster, blurrier).
-#   chunks:   store every window_seconds window, every hop_seconds, as its own point with its
-#             position, loudness and speed through embedding space, in <collection>_chunks
-#             and <collection>_tracks. Uncapped: ~4x the embedding work of clusters for
-#             typical tracks, far more for long mixes. max_* and merge_* don't apply.
-strategy = "clusters"
+strategy = "chunks"
 hop_seconds = 2.5         # chunks strategy only
 edge_seconds = 30.0       # chunks: length of the intro/outro used by vibe --wander
 max_clusters = 4

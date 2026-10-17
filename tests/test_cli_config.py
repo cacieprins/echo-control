@@ -27,7 +27,7 @@ def test_config_load_defaults_when_missing(tmp_path: Path) -> None:
     missing = tmp_path / "nonexistent.toml"
     cfg = config.load(missing)
     assert cfg.path is None
-    assert cfg.model.strategy == "clusters"
+    assert cfg.model.strategy == "chunks"
     assert cfg.player.spotatui_dir.expanduser().resolve() in cfg.library.exclude
 
 

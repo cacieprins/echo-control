@@ -21,8 +21,8 @@ def _fail(err: EchoControlError, parser: argparse.ArgumentParser | None = None) 
 def vibe(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(
         prog="vibe",
-        description="Play music from your library that sounds like the description.",
-        epilog='example: vibe "angsty lesbian music from the late 20th century"',
+        description="Walk a local music library along smooth trajectories in audio embedding space.",
+        epilog="example: vibe --orbit --from ~/Music/album/opener.flac",
     )
     p.add_argument("query", nargs="*", help="description, in quotes")
     p.add_argument("-n", "--limit", type=int, help="number of tracks")

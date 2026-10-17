@@ -1,7 +1,7 @@
 [project]
 name = "echo-control"
 version = "0.1.0"
-description = "Search a local music library by vibe with CLAP embeddings and Qdrant"
+description = "Walk a local music library along smooth trajectories in CLAP audio embedding space with Qdrant"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
