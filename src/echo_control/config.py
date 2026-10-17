@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Cacie Prins
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 from __future__ import annotations
 
 import os
@@ -62,7 +65,7 @@ class ModelConfig:
     windows: int = 3
     window_seconds: float = 10.0
     text_prefix: str = "A recording of "
-    strategy: str = StrategyName.CLUSTERS
+    strategy: str = StrategyName.CHUNKS
     max_clusters: int = 4
     min_cluster_share: float = 0.12
     merge_threshold: float = 0.85
