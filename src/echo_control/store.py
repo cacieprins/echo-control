@@ -116,10 +116,15 @@ class Store:
     def ensure(self, dim: int) -> None:
         if self.client.collection_exists(self.collection):
             vectors = self.client.get_collection(self.collection).config.params.vectors
-            if getattr(vectors, "multivector_config", None) is not None:
+            if (
+                isinstance(vectors, models.VectorParams)
+                and vectors.multivector_config is not None
+                and vectors.size == dim
+            ):
                 return
             log.warning(
-                "collection %r uses the old single-vector layout; recreating it", self.collection
+                "collection %r has an outdated layout or dimension; recreating it",
+                self.collection,
             )
             self.client.delete_collection(self.collection)
         self.client.create_collection(
@@ -208,12 +213,33 @@ class ChunkStore:
         self.client: QdrantClient = QdrantClient(url=cfg.url, timeout=30)
 
     def ensure(self, dim: int) -> None:
-        if self.client.collection_exists(self.tracks):
-            vectors = self.client.get_collection(self.tracks).config.params.vectors
-            if not isinstance(vectors, dict) or set(vectors) != set(TRACK_VECTORS):
-                log.warning("%r has an outdated layout; recreating the chunk index", self.tracks)
+        tracks_exist = self.client.collection_exists(self.tracks)
+        chunks_exist = self.client.collection_exists(self.chunks)
+        if tracks_exist or chunks_exist:
+            tracks_vecs = (
+                self.client.get_collection(self.tracks).config.params.vectors
+                if tracks_exist
+                else None
+            )
+            chunks_vecs = (
+                self.client.get_collection(self.chunks).config.params.vectors
+                if chunks_exist
+                else None
+            )
+            tracks_ok = (
+                isinstance(tracks_vecs, dict)
+                and set(tracks_vecs) == set(TRACK_VECTORS)
+                and all(v.size == dim for v in tracks_vecs.values())
+            )
+            chunks_ok = isinstance(chunks_vecs, models.VectorParams) and chunks_vecs.size == dim
+            if not (tracks_ok and chunks_ok):
+                log.warning(
+                    "%r has an outdated layout or dimension; recreating the chunk index",
+                    self.tracks,
+                )
                 self.drop()
-        if not self.client.collection_exists(self.tracks):
+                tracks_exist = chunks_exist = False
+        if not tracks_exist:
             self.client.create_collection(
                 self.tracks,
                 vectors_config={
@@ -222,7 +248,7 @@ class ChunkStore:
                 },
             )
             self.client.create_payload_index(self.tracks, "path", models.PayloadSchemaType.KEYWORD)
-        if not self.client.collection_exists(self.chunks):
+        if not chunks_exist:
             self.client.create_collection(
                 self.chunks,
                 vectors_config=models.VectorParams(

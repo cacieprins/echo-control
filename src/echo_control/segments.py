@@ -31,6 +31,10 @@ def rms_db(chunk: np.ndarray) -> float:
     return 20 * math.log10(max(rms, 1e-10))
 
 
+class _DecodeFailed(RuntimeError):
+    pass
+
+
 def _ffmpeg_stream(path: Path, n: int) -> Iterator[np.ndarray]:
     proc = subprocess.Popen(
         ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-ac", "1",
@@ -40,13 +44,18 @@ def _ffmpeg_stream(path: Path, n: int) -> Iterator[np.ndarray]:
         stderr=subprocess.DEVNULL,
     )
     assert proc.stdout is not None
+    eof = False
     try:
         while buf := proc.stdout.read(n * 4):
             yield np.frombuffer(buf, dtype=np.float32)
+        eof = True
     finally:
         proc.stdout.close()
-        proc.kill()
-        proc.wait()
+        if proc.poll() is None and not eof:
+            proc.kill()
+        rc = proc.wait()
+        if eof and rc != 0:
+            raise _DecodeFailed(f"ffmpeg exited with {rc}")
 
 
 def _librosa_full(path: Path) -> np.ndarray:
@@ -80,7 +89,10 @@ def dense_chunks(
     total = max(math.ceil(duration / window_seconds), 1) if duration else 0
     stride = max(math.ceil(total / max_chunks), 1) if total else 1
 
-    chunks, samples = _select(_ffmpeg_stream(path, n), stride)
+    try:
+        chunks, samples = _select(_ffmpeg_stream(path, n), stride)
+    except _DecodeFailed:
+        chunks, samples = [], 0
     if not chunks:
         # ffmpeg rejects some files libsndfile reads (e.g. WAV data behind an ID3 header).
         audio = _librosa_full(path)
@@ -149,14 +161,19 @@ def _ffmpeg_s16(path: Path) -> np.ndarray:
     )
     assert proc.stdout is not None
     blocks: list[np.ndarray] = []
+    eof = False
     try:
         while buf := proc.stdout.read(1 << 22):
             blocks.append(np.frombuffer(buf, dtype=np.int16))
+        eof = True
     finally:
         proc.stdout.close()
-        proc.kill()
-        proc.wait()
-    return np.concatenate(blocks) if blocks else np.zeros(0, dtype=np.int16)
+        if proc.poll() is None and not eof:
+            proc.kill()
+        rc = proc.wait()
+    if not eof or rc != 0 or not blocks:
+        return np.zeros(0, dtype=np.int16)
+    return np.concatenate(blocks)
 
 
 def sliding_chunks(

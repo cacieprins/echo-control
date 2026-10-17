@@ -85,6 +85,8 @@ def vibe(argv: list[str] | None = None) -> None:
         help="keep wandering (or orbiting) forever in mpv, queueing tracks as they play",
     )
     args = p.parse_args(argv)
+    if args.limit is not None and args.limit <= 0:
+        _die("-n/--limit must be at least 1", 2)
     if args.orbit is not None:
         if args.orbit < 0:
             _die("--orbit strength can't be negative", 2)
@@ -127,7 +129,7 @@ def vibe(argv: list[str] | None = None) -> None:
     if not store.exists():
         _die("the index is empty; start the daemon or run `echo-control scan`")
 
-    limit = args.limit or cfg.player.limit
+    limit = args.limit if args.limit is not None else cfg.player.limit
     vector = None
     if query:
         try:
@@ -153,7 +155,7 @@ def vibe(argv: list[str] | None = None) -> None:
         if found is None:
             _die(f"{seed} isn't in the chunk index")
         orbit = None
-        if args.orbit:
+        if args.orbit is not None and args.orbit > 0:
             orbit = Orbit(vector or found[1]["mean"].tolist(), args.orbit)
         if args.continuous:
             from .players import play_mpv_continuous

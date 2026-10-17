@@ -15,7 +15,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 from types import FrameType
-from typing import Any
+from typing import Any, Self
 
 from .config import DATA_DIR, PlayerConfig, socket_path
 
@@ -90,15 +90,25 @@ class _MpvIpc:
         self.next_id: int = 0
         deadline = time.monotonic() + timeout
         while True:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self.sock.connect(str(path))
+                sock.connect(str(path))
+                self.sock = sock
                 break
             except (FileNotFoundError, ConnectionRefusedError):
-                self.sock.close()
+                sock.close()
                 if proc.poll() is not None or time.monotonic() > deadline:
                     raise PlayerError("mpv exited before its IPC socket came up") from None
                 time.sleep(0.1)
+
+    def close(self) -> None:
+        self.sock.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def command(self, *args: Any) -> Any:
         self.next_id += 1
@@ -139,6 +149,8 @@ def play_mpv_continuous(
         devnull = os.open(os.devnull, os.O_RDWR)
         for fd in (0, 1, 2):
             os.dup2(devnull, fd)
+        if devnull > 2:
+            os.close(devnull)
     sock = socket_path().with_name(f"vibe-mpv-{os.getpid()}.sock")
     argv = [
         "mpv",
@@ -152,19 +164,19 @@ def play_mpv_continuous(
     proc = subprocess.Popen(argv)
     signal.signal(signal.SIGTERM, _interrupt)
     try:
-        ipc = _MpvIpc(sock, proc)
-        exhausted = False
-        while proc.poll() is None and not exhausted:
-            pos = ipc.command("get_property", "playlist-pos")
-            count = ipc.command("get_property", "playlist-count")
-            while count - max(pos, 0) - 1 < ahead:
-                path = next(tracks, None)
-                if path is None:
-                    exhausted = True
-                    break
-                ipc.command("loadfile", path, "append")
-                count += 1
-            time.sleep(1.0)
+        with _MpvIpc(sock, proc) as ipc:
+            exhausted = False
+            while proc.poll() is None and not exhausted:
+                pos = ipc.command("get_property", "playlist-pos") or 0
+                count = ipc.command("get_property", "playlist-count") or 0
+                while count - max(pos, 0) - 1 < ahead:
+                    path = next(tracks, None)
+                    if path is None:
+                        exhausted = True
+                        break
+                    ipc.command("loadfile", path, "append")
+                    count += 1
+                time.sleep(1.0)
         proc.wait()
     except (ConnectionError, BrokenPipeError):
         proc.wait()

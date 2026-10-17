@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from echo_control.segments import SAMPLE_RATE, Windows, rms_db, to_int16, window_starts
 
@@ -31,3 +32,58 @@ def test_windows_flag_silence_and_report_spans():
     assert win.silent == [False, False, True, True]
     assert win.span(1) == (5.0, 10.0)
     assert win.clip(0).dtype == np.float32
+
+
+def test_ffmpeg_midstream_failure_discards_partial_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    import subprocess
+    from pathlib import Path
+    from typing import Any
+
+    from echo_control import segments
+
+    # Simulate ffmpeg outputting 5 seconds of valid audio and then exiting with code 1.
+    partial_f32 = (0.5 * np.ones(5 * SAMPLE_RATE, dtype=np.float32)).tobytes()
+    partial_s16 = (10000 * np.ones(5 * SAMPLE_RATE, dtype=np.int16)).tobytes()
+
+    class FailingProc:
+        stdout: io.BytesIO
+        killed: bool
+
+        def __init__(self, cmd: list[str], **_kw: Any) -> None:
+            buf = partial_f32 if "f32le" in cmd else partial_s16
+            self.stdout = io.BytesIO(buf)
+            self.killed = False
+
+        def poll(self) -> int:
+            return 1
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self) -> int:
+            return 1
+
+    def fake_probe(_p: Path) -> float:
+        return 20.0
+
+    fallback_audio = 0.25 * np.ones(6 * SAMPLE_RATE, dtype=np.float32)
+
+    def fake_librosa(_p: Path) -> np.ndarray:
+        return fallback_audio
+
+    monkeypatch.setattr(subprocess, "Popen", FailingProc)
+    monkeypatch.setattr(segments, "probe_duration", fake_probe)
+    monkeypatch.setattr(segments, "_librosa_full", fake_librosa)
+
+    chunks, dur = segments.dense_chunks(Path("/corrupt.mp3"), 5.0, 10, -45.0)
+    assert len(chunks) == 1
+    assert np.allclose(chunks[0], 0.25)
+    assert dur == 6.0
+
+    win, w_dur = segments.sliding_chunks(Path("/corrupt.mp3"), 5.0, 2.5, -45.0)
+    assert w_dur == 6.0
+    assert len(win) == 2
+

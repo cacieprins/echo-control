@@ -170,7 +170,7 @@ class Clap:
 
     @staticmethod
     def _features(out: Any) -> np.ndarray:
-        # transformers >= 5 wraps projected embeddings in a model output
+        # Some transformers versions wrap projected embeddings in a model output object.
         tensor = out if hasattr(out, "cpu") else out.pooler_output
         return tensor.detach().float().cpu().numpy()
 

@@ -90,6 +90,8 @@ def test_config_load_invalid_strategy_and_hop(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("argv", "strategy", "expected_msg"),
     [
+        (["-n", "0", "rock"], "clusters", "-n/--limit must be at least 1"),
+        (["-n", "-5", "rock"], "clusters", "-n/--limit must be at least 1"),
         (["--orbit", "-1", "rock"], "chunks", "--orbit strength can't be negative"),
         (
             ["--continuous", "--json", "rock"],
@@ -241,3 +243,168 @@ def test_players_play_stdout_and_errors(capsys: pytest.CaptureFixture[str]) -> N
         players.play("winamp", ["/x.mp3"], "test", p_cfg)
 
 
+def test_store_and_chunk_store_ensure_recreate_on_dim_mismatch() -> None:
+    from types import SimpleNamespace
+    from typing import Any
+
+    from qdrant_client import models
+
+    from echo_control.config import QdrantConfig
+    from echo_control.store import TRACK_VECTORS, ChunkStore, Store
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.collections: dict[str, Any] = {}
+            self.deleted: list[str] = []
+
+        def collection_exists(self, name: str) -> bool:
+            return name in self.collections
+
+        def get_collection(self, name: str) -> Any:
+            return SimpleNamespace(
+                config=SimpleNamespace(params=SimpleNamespace(vectors=self.collections[name]))
+            )
+
+        def delete_collection(self, name: str) -> None:
+            self.deleted.append(name)
+            self.collections.pop(name, None)
+
+        def create_collection(self, name: str, vectors_config: Any, **_kwargs: Any) -> None:
+            self.collections[name] = vectors_config
+
+        def create_payload_index(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+    s = Store.__new__(Store)
+    s.cfg = QdrantConfig(collection="col")
+    s.collection = "col"
+    fake = FakeClient()
+    s.client = fake  # pyright: ignore[reportAttributeAccessIssue]
+    s.ensure(512)
+    assert fake.deleted == []
+    s.ensure(512)
+    assert fake.deleted == []
+    s.ensure(256)
+    assert fake.deleted == ["col"]
+    assert fake.collections["col"].size == 256
+
+    cs = ChunkStore.__new__(ChunkStore)
+    cs.cfg = QdrantConfig(collection="col")
+    cs.collection = "col"
+    cs.tracks = "col_tracks"
+    cs.chunks = "col_chunks"
+    cs.sustain_windows = 1
+    fake_c = FakeClient()
+    cs.client = fake_c  # pyright: ignore[reportAttributeAccessIssue]
+    cs.ensure(512)
+    assert fake_c.deleted == []
+    cs.ensure(512)
+    assert fake_c.deleted == []
+    # Mismatch on chunks collection triggers recreation of both
+    fake_c.collections["col_chunks"] = models.VectorParams(size=128, distance=models.Distance.COSINE)
+    cs.ensure(512)
+    assert set(fake_c.deleted) == {"col_chunks", "col_tracks"}
+    assert all(fake_c.collections["col_tracks"][k].size == 512 for k in TRACK_VECTORS)
+    assert fake_c.collections["col_chunks"].size == 512
+
+
+def test_play_mpv_continuous_handles_none_playlist_pos(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import shutil
+    import subprocess
+    import time
+    from typing import Any, Self
+
+    def fake_which(_cmd: str) -> str:
+        return "/usr/bin/mpv"
+
+    def fake_sleep(_s: float) -> None:
+        pass
+
+    monkeypatch.setattr(players, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(players, "socket_path", lambda: tmp_path / "daemon.sock")
+    monkeypatch.setattr(shutil, "which", fake_which)
+    monkeypatch.setattr(time, "sleep", fake_sleep)
+
+    appended: list[str] = []
+    closed: list[bool] = []
+
+    class FakeProc:
+        polls: int
+
+        def __init__(self, *_a: Any, **_kw: Any) -> None:
+            self.polls = 0
+
+        def poll(self) -> int | None:
+            self.polls += 1
+            return None if self.polls <= 2 else 0
+
+        def wait(self) -> int:
+            return 0
+
+    class FakeIpc:
+        def __init__(self, *_a: Any, **_kw: Any) -> None:
+            pass
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            closed.append(True)
+
+        def command(self, *args: Any) -> Any:
+            if args == ("get_property", "playlist-pos"):
+                return None
+            if args == ("get_property", "playlist-count"):
+                return 1
+            if args[0] == "loadfile":
+                appended.append(args[1])
+            return None
+
+    monkeypatch.setattr(subprocess, "Popen", FakeProc)
+    monkeypatch.setattr(players, "_MpvIpc", FakeIpc)
+
+    players.play_mpv_continuous(
+        iter(["/1.mp3", "/2.mp3", "/3.mp3", "/4.mp3"]), "walk", detach=False, ahead=2
+    )
+    assert appended == ["/4.mp3"]
+    assert closed == [True]
+
+
+def test_daemon_handler_and_request_edge_cases(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import socket
+    import threading
+
+    from watchdog.events import DirDeletedEvent
+
+    from echo_control import daemon
+
+    scans: list[bool] = []
+
+    class FakeDaemon:
+        def request_scan(self) -> None:
+            scans.append(True)
+
+    handler = daemon._Handler(FakeDaemon())  # pyright: ignore[reportArgumentType, reportPrivateUsage]
+    handler.on_any_event(DirDeletedEvent("/music/album"))
+    assert scans == [True]
+
+    # Test request() when server closes socket immediately without sending newline
+    sock_file = tmp_path / "test.sock"
+    monkeypatch.setattr(daemon, "socket_path", lambda: sock_file)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_file))
+    srv.listen(1)
+
+    def accept_and_close() -> None:
+        conn, _ = srv.accept()
+        conn.close()
+        srv.close()
+
+    t = threading.Thread(target=accept_and_close)
+    t.start()
+    assert daemon.request({"op": "status"}, timeout=2.0) is None
+    t.join()

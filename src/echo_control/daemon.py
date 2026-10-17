@@ -81,7 +81,7 @@ class _Handler(FileSystemEventHandler):
         if event.event_type not in CHANGE_EVENTS:
             return
         if event.is_directory:
-            if event.event_type in ("created", "moved"):
+            if event.event_type in ("created", "moved", "deleted"):
                 self.daemon.request_scan()
             return
         for p in (event.src_path, getattr(event, "dest_path", "")):
@@ -143,8 +143,11 @@ class Daemon:
     def _scan_loop(self) -> None:
         while not self.stop.is_set():
             self.state["scanning"] = True
+            result = None
             try:
                 result = self._run_job(None)
+            except Exception:
+                log.exception("scan job failed")
             finally:
                 self.state["scanning"] = False
             if result is not None:
@@ -214,7 +217,10 @@ class Daemon:
                 except Exception as e:
                     log.exception("request failed")
                     resp = {"error": str(e)}
-                self.wfile.write(json.dumps(resp).encode() + b"\n")
+                try:
+                    self.wfile.write(json.dumps(resp).encode() + b"\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
 
         class Server(socketserver.ThreadingUnixStreamServer):
             daemon_threads: bool = True
@@ -278,7 +284,9 @@ def request(req: dict[str, Any], timeout: float = 30.0) -> dict[str, Any] | None
                 if not chunk:
                     break
                 buf += chunk
-    except (ConnectionRefusedError, FileNotFoundError, TimeoutError):
+    except (ConnectionRefusedError, FileNotFoundError, TimeoutError, OSError):
+        return None
+    if not buf.strip():
         return None
     resp = json.loads(buf)
     if "error" in resp:
