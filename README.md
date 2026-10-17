@@ -1,5 +1,10 @@
 # echo-control
 
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
+[![Python: 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](pyproject.toml)
+[![Backend: ROCm / CUDA / CPU](https://img.shields.io/badge/backend-ROCm_%7C_CUDA_%7C_CPU-purple.svg)](#gpu-acceleration)
+[![Demo: 10-Track Walk](https://img.shields.io/badge/playlist-YouTube_Demo-red.svg)](https://www.youtube.com/watch_videos?video_ids=0F76LgpKQcg,R-XiVtp2ISg,un8EW82GwKc,4qQyUi4zfDs,Aw8GucJ4f7E,SO_PYTFgHIg,5q3Uyze7GGg,046uwk0miGU,6c7dDgYuap4,R8XgP8C2oqU)
+
 Walk a local music library along smooth trajectories in audio embedding space.
 
 Every track is sliced into overlapping windows, embedded with
@@ -39,7 +44,7 @@ prog metal: stuff you probably wouldn't think to put on the same playlist, but i
 vibe --orbit -n 10 --from ~/Music/"Hybrid/Morning Sci-Fi/09 Steal You Away.mp3"
 ```
 
-| # | Track | Album | Seam (`pos`) | Heading (`dir`) | Pace (`drift`) | Orbit (`ctr`) | Total |
+| # | Track | Album | `pos` | `dir` | `drift` | `ctr` | Total |
 | --: | --- | --- | --: | --: | --: | --: | --: |
 | 1 | [Hybrid – *Steal You Away*](https://www.youtube.com/watch?v=0F76LgpKQcg) | *Morning Sci-Fi* | — | — | — | — | seed |
 | 2 | [The Who – *The Rock*](https://www.youtube.com/watch?v=R-XiVtp2ISg) | *Quadrophenia* | `+0.74` | `+0.29` | `-0.09` | `+0.75` | **`+1.62`** |
@@ -52,17 +57,29 @@ vibe --orbit -n 10 --from ~/Music/"Hybrid/Morning Sci-Fi/09 Steal You Away.mp3"
 | 9 | [Tulku – *Anni Rose*](https://www.youtube.com/watch?v=6c7dDgYuap4) | *Trancendence* | `+0.83` | `+0.14` | `-0.33` | `+0.77` | **`+1.58`** |
 | 10 | [Dream Theater – *Trial of Tears*](https://www.youtube.com/watch?v=R8XgP8C2oqU) | *Falling Into Infinity* | `+0.72` | `+0.39` | `-0.00` | `+0.58` | **`+1.50`** |
 
-▶ [**Listen to this 10-track walk as a YouTube playlist**](https://www.youtube.com/watch_videos?video_ids=0F76LgpKQcg,R-XiVtp2ISg,un8EW82GwKc,4qQyUi4zfDs,Aw8GucJ4f7E,SO_PYTFgHIg,5q3Uyze7GGg,046uwk0miGU,6c7dDgYuap4,R8XgP8C2oqU)
+<p align="center">
+  <a href="https://www.youtube.com/watch_videos?video_ids=0F76LgpKQcg,R-XiVtp2ISg,un8EW82GwKc,4qQyUi4zfDs,Aw8GucJ4f7E,SO_PYTFgHIg,5q3Uyze7GGg,046uwk0miGU,6c7dDgYuap4,R8XgP8C2oqU">
+    <img src="https://img.youtube.com/vi/0F76LgpKQcg/maxresdefault.jpg" width="680" alt="Play 10-track walk on YouTube">
+  </a>
+  <br>
+  ▶ <a href="https://www.youtube.com/watch_videos?video_ids=0F76LgpKQcg,R-XiVtp2ISg,un8EW82GwKc,4qQyUi4zfDs,Aw8GucJ4f7E,SO_PYTFgHIg,5q3Uyze7GGg,046uwk0miGU,6c7dDgYuap4,R8XgP8C2oqU"><strong>Listen to this 10-track walk as a YouTube playlist</strong></a>
+</p>
 
-- **Cross-genre seams (`1 -> 2` and `9 -> 10`):** *Steal You Away*'s synth-and-strings outro hands
-  off straight into *Quadrophenia*'s *The Rock* (`pos = +0.74`, `dir = +0.29`, nearly identical
+- **Cross-genre transitions (`1 -> 2` and `9 -> 10`):** *Steal You Away*'s synth-and-strings outro hands
+  off straight into *Quadrophenia*'s *The Rock* (`pos = +0.74`, `dir = +0.29`, which has nearly identical
   pace `drift = -0.09`). At the end, *Tulku*'s *Anni Rose* flows into the rain-and-clean-guitar
   intro of Dream Theater's *Trial of Tears* with an exact pace match (`drift = -0.00`) and aligned
   heading (`dir = +0.39`).
 - **Album gravity (`3 -> 4 -> 5`):** After *The Rock*, it lands on *Portishead – Sour Times* (pulled in
-  by a `+0.86` orbit match to the seed), *Dummy*'s dusty vinyl/vocal mastering is so cohesive that
-  three tracks chain in a row (`+0.80` into *Glory Box*, `+0.77` into *It Could Be Sweet*) before
-  *It Could Be Sweet*'s outro bridges out to *Sneaker Pimps* and *BT*.
+  by a `+0.86` orbit match to the seed). *Dummy*'s dusty vinyl/vocal mastering is so cohesive that
+  three tracks chain in a row before *It Could Be Sweet*'s outro bridges out to *Sneaker Pimps* and *BT*.
+- **Narrative arc & crescendo (`5 -> 7 -> 10`):** The handoff from *It Could Be Sweet* into *Sneaker
+  Pimps – Grazes* and *BT – Dark Heart Dawning* steps up angular pace (drift steps from `0.018` →
+  `0.024` → `0.028` rad/s, with average speed climbing from `0.092` to `0.116`). This pushes through *Dark Heart Dawning*
+  before relaxing into *Delerium – Duende* and *Tulku – Anni Rose* as a
+  breather before the 13-minute Dream Theater
+  finale (*Trial of Tears*). Nothing in the scorer asks for a three-act structure: it fell out of the
+  trajectory geometry on its own.
 
 ## Setup
 
