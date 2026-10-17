@@ -451,3 +451,91 @@ def test_errors_hierarchy_and_cli_exit_codes(
     assert exc.value.code == 1
     assert "error: broken toml" in capsys.readouterr().err
 
+
+def test_commands_choose_backend_and_json_formatting() -> None:
+    import json
+
+    from echo_control.commands import (
+        VibeRequest,
+        choose_backend,
+        format_tracks_json,
+        validate_vibe,
+    )
+    from echo_control.errors import UsageError
+
+    cfg = Config(player=PlayerConfig(backend="mpv"), model=ModelConfig(strategy="chunks"))
+
+    # When not a tty and not detached and no explicit player, falls back to stdout
+    assert choose_backend(VibeRequest(query=["rock"]), cfg, is_tty=False) == "stdout"
+    assert choose_backend(VibeRequest(query=["rock"]), cfg, is_tty=True) == "mpv"
+    assert choose_backend(VibeRequest(query=["rock"], detach=True), cfg, is_tty=False) == "mpv"
+    assert (
+        choose_backend(VibeRequest(query=["rock"], player="spotatui"), cfg, is_tty=False)
+        == "spotatui"
+    )
+    assert choose_backend(VibeRequest(query=["rock"], print_m3u=True), cfg, is_tty=True) == "stdout"
+
+    # validate_vibe sets wander=True when orbit or continuous is provided
+    req_orbit = VibeRequest(query=["rock"], orbit=1.5)
+    validate_vibe(req_orbit, cfg)
+    assert req_orbit.wander is True
+
+    with pytest.raises(UsageError) as exc:
+        validate_vibe(VibeRequest(), cfg)
+    assert exc.value.show_usage is True
+
+    roots = [Path("/music")]
+    formatted = json.loads(
+        format_tracks_json(
+            [("/music/album/song.flac", 0.87654), ("/music/root.mp3", 0.5), ("/other/x.ogg", 0.1)],
+            roots,
+        )
+    )
+    assert formatted == [
+        {"path": "/music/album/song.flac", "name": "song", "dir": "album", "score": 0.8765},
+        {"path": "/music/root.mp3", "name": "root", "dir": "music", "score": 0.5},
+        {"path": "/other/x.ogg", "name": "x", "dir": "/other", "score": 0.1},
+    ]
+
+
+def test_commands_format_status() -> None:
+    from echo_control.commands import Status, format_status
+
+    st_stopped = Status(
+        config_path=None,
+        library_paths=[Path("/music")],
+        qdrant_url="http://localhost:6333",
+        qdrant_ready=True,
+        daemon_status=None,
+        daemon_error="boom",
+        indexed_fallback=42,
+    )
+    text_stopped = format_status(st_stopped)
+    assert "config:  (defaults, no config file)" in text_stopped
+    assert "qdrant:  http://localhost:6333 ready" in text_stopped
+    assert "daemon:  error: boom" in text_stopped
+    assert "daemon:  not running" in text_stopped
+    assert "indexed: 42 tracks" in text_stopped
+
+    st_running = Status(
+        config_path=Path("/etc/echo.toml"),
+        library_paths=[Path("/music")],
+        qdrant_url="http://localhost:6333",
+        qdrant_ready=True,
+        daemon_status={
+            "model": "clap",
+            "device": "cpu",
+            "strategy": "chunks",
+            "indexed": 100,
+            "scanning": False,
+            "indexing": False,
+            "last_scan": {"files": 100, "indexed": 5, "removed": 1},
+            "pending": 3,
+        },
+    )
+    text_running = format_status(st_running)
+    assert "daemon:  running (clap on cpu, chunks strategy)" in text_running
+    assert "scan:    last found 100 files, indexed 5, removed 1" in text_running
+    assert "pending: 3 changed files" in text_running
+
+

@@ -1,22 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import json
-import os
-import random
-import shutil
-import subprocess
 import sys
-from collections.abc import Callable
-from pathlib import Path
 from typing import NoReturn
 
+from . import commands
 from . import config as config_mod
 from .errors import EchoControlError, UsageError
-from .players import BACKENDS, play
-from .store import is_ready
-
-Handler = Callable[[config_mod.Config, argparse.Namespace], None]
+from .players import BACKENDS
 
 
 def _fail(err: EchoControlError, parser: argparse.ArgumentParser | None = None) -> NoReturn:
@@ -25,141 +16,6 @@ def _fail(err: EchoControlError, parser: argparse.ArgumentParser | None = None) 
     if str(err):
         print(f"error: {err}", file=sys.stderr)
     sys.exit(err.exit_code)
-
-
-def _contrib_dir() -> Path:
-    here = Path(__file__).resolve().parent
-    for candidate in (here / "contrib", here.parent.parent / "contrib"):
-        if candidate.is_dir():
-            return candidate
-    raise EchoControlError("contrib files not found in the installation")
-
-
-def _embed_text(cfg: config_mod.Config, text: str) -> list[float]:
-    from .daemon import request
-
-    resp = request({"op": "embed", "text": text})
-    if resp is not None:
-        return resp["vector"]
-    print("daemon not running; loading CLAP locally...", file=sys.stderr)
-    from .clap import TextEncoder
-
-    return TextEncoder(cfg.model).embed_text(text)
-
-
-def _relative_dir(path: Path, roots: list[Path]) -> str:
-    for root in roots:
-        if path.is_relative_to(root):
-            rel = path.parent.relative_to(root)
-            return str(rel) if str(rel) != "." else root.name
-    return str(path.parent)
-
-
-def _run_vibe(args: argparse.Namespace) -> None:
-    if args.limit is not None and args.limit <= 0:
-        raise UsageError("-n/--limit must be at least 1")
-    if args.orbit is not None:
-        if args.orbit < 0:
-            raise UsageError("--orbit strength can't be negative")
-        args.wander = True
-    if args.continuous:
-        args.wander = True
-        if args.json or args.print:
-            raise UsageError(
-                "--continuous plays in mpv; it can't be combined with --json or --print"
-            )
-    cfg = config_mod.load()
-    if args.continuous and (args.player or cfg.player.backend) != "mpv":
-        raise UsageError("--continuous needs the mpv player")
-
-    if args.play_path:
-        backend = args.player or cfg.player.backend
-        play(backend, args.play_path, Path(args.play_path[0]).stem, cfg.player, args.detach)
-        return
-
-    if len(args.query) > 1:
-        raise UsageError(f'put the query in quotes, e.g. vibe "{" ".join(args.query)}"')
-    if args.seed and not args.wander:
-        raise UsageError("--from only applies to --wander and --orbit")
-    if args.wander and args.shuffle:
-        raise UsageError("--shuffle would undo the walk's ordering")
-    if args.wander and cfg.model.strategy != "chunks":
-        raise UsageError('--wander and --orbit need [model] strategy = "chunks"')
-    query = args.query[0].strip() if args.query else ""
-    if not query and not args.seed:
-        raise UsageError(show_usage=True)
-
-    if not is_ready(cfg.qdrant.url):
-        raise EchoControlError(
-            f"Qdrant not reachable at {cfg.qdrant.url} (systemctl --user start echo-control)"
-        )
-
-    from .store import open_store
-
-    store = open_store(cfg)
-    if not store.exists():
-        raise EchoControlError("the index is empty; start the daemon or run `echo-control scan`")
-
-    limit = args.limit if args.limit is not None else cfg.player.limit
-    vector = None
-    if query:
-        try:
-            vector = _embed_text(cfg, query)
-        except RuntimeError as e:
-            raise EchoControlError(f"embedding failed: {e}") from e
-    scores = []
-    if args.seed:
-        seed = str(Path(args.seed).expanduser().resolve())
-    else:
-        assert vector is not None
-        hits = store.search(vector, 1 if args.wander else limit, cfg.search.share_weight)
-        if args.wander and not hits:
-            raise EchoControlError("nothing matched to start wandering from")
-        seed = hits[0].path if hits else ""
-        scores = [(h.path, h.score) for h in hits]
-    if args.wander:
-        from .store import ChunkStore
-        from .wander import Orbit, walk, wander
-
-        assert isinstance(store, ChunkStore)
-
-        found = store.track(seed)
-        if found is None:
-            raise EchoControlError(f"{seed} isn't in the chunk index")
-        orbit = None
-        if args.orbit is not None and args.orbit > 0:
-            orbit = Orbit(vector or found[1]["mean"].tolist(), args.orbit)
-        if args.continuous:
-            from .players import play_mpv_continuous
-
-            steps = (t.path for t in walk(store, seed, cfg.wander, orbit))
-            play_mpv_continuous(steps, query or f"wander from {Path(seed).stem}", args.detach)
-            return
-        chain = wander(store, seed, limit, cfg.wander, orbit)
-        scores = [(t.path, t.score) for t in chain]
-
-    if args.json:
-        out = [
-            {
-                "path": path,
-                "name": Path(path).stem,
-                "dir": _relative_dir(Path(path), cfg.library.paths),
-                "score": round(score, 4),
-            }
-            for path, score in scores
-        ]
-        json.dump(out, sys.stdout)
-        sys.stdout.write("\n")
-        return
-
-    paths = [path for path, _ in scores]
-    if args.shuffle:
-        random.shuffle(paths)
-    if args.print or not (sys.stdout.isatty() or args.detach or args.player):
-        backend = "stdout"
-    else:
-        backend = args.player or cfg.player.backend
-    play(backend, paths, query or f"wander from {Path(seed).stem}", cfg.player, args.detach)
 
 
 def vibe(argv: list[str] | None = None) -> None:
@@ -196,136 +52,29 @@ def vibe(argv: list[str] | None = None) -> None:
         help="keep wandering (or orbiting) forever in mpv, queueing tracks as they play",
     )
     args = p.parse_args(argv)
+    req = commands.VibeRequest(
+        query=args.query,
+        limit=args.limit,
+        player=args.player,
+        shuffle=args.shuffle,
+        print_m3u=args.print,
+        as_json=args.json,
+        detach=args.detach,
+        play_path=args.play_path,
+        wander=args.wander,
+        orbit=args.orbit,
+        seed=args.seed,
+        continuous=args.continuous,
+    )
     try:
-        _run_vibe(args)
+        cfg = config_mod.load()
+        out = commands.run_vibe(req, cfg, is_tty=sys.stdout.isatty())
+        if out is not None:
+            print(out)
     except EchoControlError as e:
         _fail(e, p)
     except KeyboardInterrupt:
         sys.exit(130)
-
-
-def cmd_daemon(cfg: config_mod.Config, _args: argparse.Namespace) -> None:
-    from .daemon import Daemon, setup_logging
-
-    setup_logging()
-    Daemon(cfg).serve()
-
-
-def cmd_scan(cfg: config_mod.Config, _args: argparse.Namespace) -> None:
-    from .daemon import setup_logging
-
-    setup_logging()
-    from .clap import load_encoders
-    from .indexer import Indexer
-    from .store import open_store, wait_ready
-
-    wait_ready(cfg.qdrant.url, cfg.qdrant.ready_timeout)
-    total, added, removed = Indexer(cfg, load_encoders(cfg.model), open_store(cfg)).scan()
-    print(f"{total} files, {added} indexed, {removed} removed")
-
-
-def cmd_reindex(cfg: config_mod.Config, args: argparse.Namespace) -> None:
-    from .store import open_store, wait_ready
-
-    wait_ready(cfg.qdrant.url, cfg.qdrant.ready_timeout)
-    open_store(cfg).drop()
-    print(f"dropped the {cfg.model.strategy} index for {cfg.qdrant.collection!r}")
-    from .daemon import request
-
-    try:
-        running = request({"op": "status"}, timeout=5) is not None
-    except RuntimeError:
-        running = False
-    if running:
-        print("restart the daemon to rebuild: systemctl --user restart echo-control")
-    else:
-        cmd_scan(cfg, args)
-
-
-def cmd_status(cfg: config_mod.Config, _args: argparse.Namespace) -> None:
-    from .daemon import request
-
-    print(f"config:  {cfg.path or '(defaults, no config file)'}")
-    print(f"library: {', '.join(map(str, cfg.library.paths))}")
-    ready = is_ready(cfg.qdrant.url)
-    print(f"qdrant:  {cfg.qdrant.url} {'ready' if ready else 'NOT REACHABLE'}")
-    try:
-        st = request({"op": "status"}, timeout=5)
-    except RuntimeError as e:
-        st = None
-        print(f"daemon:  error: {e}")
-    if st is None:
-        print("daemon:  not running")
-        if ready:
-            from .store import open_store
-
-            print(f"indexed: {open_store(cfg).count()} tracks")
-        return
-    print(f"daemon:  running ({st['model']} on {st['device']}, {st.get('strategy', 'mean')} strategy)")
-    print(f"indexed: {st['indexed']} tracks")
-    scan = st.get("last_scan")
-    if st["scanning"]:
-        print("scan:    in progress (journalctl --user -fu echo-control)")
-    elif st.get("indexing"):
-        print("scan:    indexing changed files")
-    elif scan:
-        print(f"scan:    last found {scan['files']} files, indexed {scan['indexed']}, removed {scan['removed']}")
-    if st["pending"]:
-        print(f"pending: {st['pending']} changed files")
-
-
-def _run(argv: list[str]) -> None:
-    print("$ " + " ".join(argv))
-    r = subprocess.run(argv, capture_output=True, text=True, check=False)
-    out = (r.stdout + r.stderr).strip()
-    if out:
-        print(out)
-    if r.returncode != 0:
-        raise EchoControlError(f"{argv[0]} exited with {r.returncode}")
-
-
-def cmd_install_service(_cfg: config_mod.Config, _args: argparse.Namespace) -> None:
-    contrib = _contrib_dir()
-    exe = shutil.which("echo-control") or str(Path(sys.argv[0]).resolve())
-    unit_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd/user"
-    unit_dir.mkdir(parents=True, exist_ok=True)
-    config_mod.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    (config_mod.DATA_DIR / "qdrant").mkdir(parents=True, exist_ok=True)
-
-    compose = config_mod.CONFIG_DIR / "docker-compose.yml"
-    compose.write_text(
-        (contrib / "docker-compose.yml")
-        .read_text()
-        .replace("@DATA_DIR@", str(config_mod.DATA_DIR))
-    )
-    print(f"wrote {compose}")
-    for name in ("echo-control-qdrant.service", "echo-control.service"):
-        text = (contrib / name).read_text()
-        text = text.replace("@EXE@", exe).replace("@COMPOSE@", str(compose))
-        text = text.replace("@DOCKER@", shutil.which("docker") or "/usr/bin/docker")
-        (unit_dir / name).write_text(text)
-        print(f"wrote {unit_dir / name}")
-    if not config_mod.CONFIG_PATH.exists():
-        example = contrib / "config.example.toml"
-        if example.exists():
-            shutil.copy(example, config_mod.CONFIG_PATH)
-            print(f"wrote {config_mod.CONFIG_PATH} (edit library paths)")
-    _run(["systemctl", "--user", "daemon-reload"])
-    print("next: systemctl --user enable --now echo-control")
-
-
-def cmd_install_noctalia(_cfg: config_mod.Config, _args: argparse.Namespace) -> None:
-    if not shutil.which("noctalia"):
-        raise EchoControlError("noctalia is not installed")
-    source = _contrib_dir() / "noctalia"
-    r = subprocess.run(
-        ["noctalia", "msg", "plugins", "source", "list"], capture_output=True, text=True, check=False
-    )
-    if not any(line.split()[:1] == ["vibe"] for line in r.stdout.splitlines()):
-        _run(["noctalia", "msg", "plugins", "source", "add", "vibe", "path", str(source)])
-    _run(["noctalia", "msg", "plugins", "update", "vibe"])
-    _run(["noctalia", "msg", "plugins", "enable", "case/vibe"])
-    print("type /vibe <query> in the launcher")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -340,16 +89,22 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
 
     try:
+        if args.cmd == "install-service":
+            commands.install_service()
+            return
+        if args.cmd == "install-noctalia":
+            commands.install_noctalia()
+            return
         cfg = config_mod.load()
-        handler: Handler = {
-            "daemon": cmd_daemon,
-            "scan": cmd_scan,
-            "reindex": cmd_reindex,
-            "status": cmd_status,
-            "install-service": cmd_install_service,
-            "install-noctalia": cmd_install_noctalia,
-        }[args.cmd]
-        handler(cfg, args)
+        if args.cmd == "daemon":
+            commands.run_daemon(cfg)
+        elif args.cmd == "scan":
+            print(commands.run_scan(cfg))
+        elif args.cmd == "reindex":
+            for line in commands.run_reindex(cfg):
+                print(line)
+        elif args.cmd == "status":
+            print(commands.format_status(commands.collect_status(cfg)))
     except EchoControlError as e:
         _fail(e, p)
     except KeyboardInterrupt:
