@@ -4,8 +4,16 @@ import os
 import re
 import tomllib
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+
+class StrategyName(StrEnum):
+    MEAN = "mean"
+    CLUSTERS = "clusters"
+    CHUNKS = "chunks"
+
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "echo-control"
 CONFIG_PATH = CONFIG_DIR / "config.toml"
@@ -49,7 +57,7 @@ class ModelConfig:
     windows: int = 3
     window_seconds: float = 10.0
     text_prefix: str = "A recording of "
-    strategy: str = "clusters"
+    strategy: str = StrategyName.CLUSTERS
     max_clusters: int = 4
     min_cluster_share: float = 0.12
     merge_threshold: float = 0.85
@@ -128,7 +136,7 @@ def load(path: Path | None = None) -> Config:
     library.exclude.append(player.spotatui_dir.expanduser().resolve())
 
     model = ModelConfig(**raw.get("model", {}))
-    if model.strategy not in ("mean", "clusters", "chunks"):
+    if model.strategy not in StrategyName:
         raise ValueError(
             f"[model] strategy must be 'mean', 'clusters' or 'chunks', not {model.strategy!r}"
         )

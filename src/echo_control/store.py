@@ -12,7 +12,7 @@ from typing import Any, Protocol, runtime_checkable
 import numpy as np
 from qdrant_client import QdrantClient, models
 
-from .config import Config, QdrantConfig
+from .config import QdrantConfig
 from .errors import EchoControlError
 
 log = logging.getLogger(__name__)
@@ -85,6 +85,11 @@ class VectorIndex(Protocol):
 
 
 @runtime_checkable
+class MultivectorIndex(VectorIndex, Protocol):
+    def upsert(self, path: str, vectors: list[list[float]], payload: dict[str, Any]) -> None: ...
+
+
+@runtime_checkable
 class ChunkIndex(VectorIndex, Protocol):
     def replace_track(
         self,
@@ -134,13 +139,6 @@ def _iter_payloads(client: QdrantClient, collection: str) -> Iterator[dict[str, 
 def _payloads(client: QdrantClient, collection: str, paths: list[str]) -> list[dict[str, Any]]:
     points = client.retrieve(collection, ids=[point_id(p) for p in paths], with_payload=True)
     return [pt.payload for pt in points if pt.payload]
-
-
-def open_store(cfg: Config) -> Store | ChunkStore:
-    if cfg.model.strategy == "chunks":
-        sustain = max(1, round(cfg.search.sustain_seconds / cfg.model.hop_seconds))
-        return ChunkStore(cfg.qdrant, sustain)
-    return Store(cfg.qdrant, share_weight=cfg.search.share_weight)
 
 
 class Store:

@@ -235,3 +235,27 @@ class InMemoryChunkIndex:
         )
         hits.sort(key=lambda h: -h.score)
         return hits[:limit]
+
+
+class FakeAudioEncoder:
+    """Deterministic in-memory audio encoder for unit testing Indexer and Strategies."""
+
+    def __init__(self, dim: int = 8, device: str = "cpu"):
+        self.dim: int = dim
+        self.device: str = device
+
+    def embed_clips(self, clips: list[np.ndarray]) -> np.ndarray:
+        if not clips:
+            raise ValueError("no decodable audio")
+        out = np.zeros((len(clips), self.dim), dtype=np.float32)
+        for i, c in enumerate(clips):
+            out[i, i % self.dim] = 1.0
+            if len(c):
+                out[i, 0] += float(np.mean(c)) * 0.01
+        norms = np.maximum(np.linalg.norm(out, axis=-1, keepdims=True), 1e-12)
+        return (out / norms).astype(np.float32)
+
+    def embed_windows(self, windows: Any) -> np.ndarray:
+        if not len(windows):
+            raise ValueError("no decodable audio")
+        return self.embed_clips([windows.clip(i) for i in range(len(windows))])

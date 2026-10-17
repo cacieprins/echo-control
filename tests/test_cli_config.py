@@ -611,4 +611,92 @@ def test_records_and_index_protocols() -> None:
     assert np.allclose(vecs, np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32))
 
 
+def test_strategies_and_indexer_scan_with_fakes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import numpy as np
+
+    from echo_control.config import Config, LibraryConfig, ModelConfig, StrategyName
+    from echo_control.indexer import Indexer
+    from echo_control.segments import SAMPLE_RATE, Windows
+    from echo_control.strategies import AudioEncoder, Strategy, get_strategy
+    from tests.fakes import FakeAudioEncoder, InMemoryChunkIndex, InMemoryVectorIndex
+
+    enc = FakeAudioEncoder(dim=8)
+    assert isinstance(enc, AudioEncoder)
+
+    for name in StrategyName:
+        strat = get_strategy(name)
+        assert isinstance(strat, Strategy)
+        assert strat.name == name
+        assert strat.supports_wander is (name == StrategyName.CHUNKS)
+
+    with pytest.raises(ValueError, match="strategy must be"):
+        get_strategy("nonexistent")
+
+    music_dir = tmp_path / "music"
+    music_dir.mkdir()
+    song_a = music_dir / "a.mp3"
+    song_b = music_dir / "b.flac"
+    song_a.write_bytes(b"fake-audio-a")
+    song_b.write_bytes(b"fake-audio-b")
+
+    # 1. Test Indexer.scan and index_file with ChunksStrategy + InMemoryChunkIndex
+    cfg_chunks = Config(
+        library=LibraryConfig(paths=[music_dir], extensions=["mp3", "flac"]),
+        model=ModelConfig(strategy=StrategyName.CHUNKS, window_seconds=2.0, hop_seconds=1.0),
+    )
+    chunk_store = InMemoryChunkIndex()
+    indexer_chunks = Indexer(cfg_chunks, [enc], chunk_store)
+
+    def fake_decode_chunks(_path: Path) -> tuple[Windows, float]:
+        pcm = np.ones(SAMPLE_RATE * 3, dtype=np.int16) * 1000
+        win = Windows(
+            audio=pcm,
+            starts=[0, SAMPLE_RATE],
+            size=SAMPLE_RATE * 2,
+            db=[-20.0, -20.0],
+            silent=[False, False],
+        )
+        return win, 3.0
+
+    monkeypatch.setattr(indexer_chunks, "decode", fake_decode_chunks)
+    stats1 = indexer_chunks.scan()
+    assert (stats1.total, stats1.indexed, stats1.removed) == (2, 2, 0)
+    assert chunk_store.count() == 2
+    assert chunk_store.chunk_count() == 4  # 2 windows per track
+
+    # Second scan with unchanged files should index 0
+    stats2 = indexer_chunks.scan()
+    assert (stats2.total, stats2.indexed, stats2.removed) == (2, 0, 0)
+
+    # Removing song_b and rescanning should prune it
+    song_b.unlink()
+    stats3 = indexer_chunks.scan()
+    assert (stats3.total, stats3.indexed, stats3.removed) == (1, 0, 1)
+    assert chunk_store.count() == 1
+    assert chunk_store.chunk_count() == 2
+
+    # 2. Test Indexer.index_file with MeanStrategy & ClustersStrategy + InMemoryVectorIndex
+    def fake_decode_clips(_path: Path) -> tuple[list[np.ndarray], float]:
+        return [
+            np.ones(SAMPLE_RATE, dtype=np.float32),
+            np.ones(SAMPLE_RATE, dtype=np.float32) * 0.5,
+        ], 12.0
+
+    for strat_name in (StrategyName.MEAN, StrategyName.CLUSTERS):
+        cfg_mv = Config(
+            library=LibraryConfig(paths=[music_dir], extensions=["mp3"]),
+            model=ModelConfig(strategy=strat_name),
+        )
+        mv_store = InMemoryVectorIndex()
+        indexer_mv = Indexer(cfg_mv, [enc], mv_store)
+        monkeypatch.setattr(indexer_mv, "decode", fake_decode_clips)
+        assert indexer_mv.index_file(song_a) is True
+        assert mv_store.count() == 1
+        pl = mv_store.payloads([str(song_a)])[0]
+        assert pl["embedding"] == get_strategy(strat_name).signature(cfg_mv.model)
+
+
+
 

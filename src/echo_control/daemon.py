@@ -22,7 +22,8 @@ from .clap import TextEncoder, signature
 from .config import Config, socket_path
 from .indexer import current_key, is_audio, state_key
 from .records import ScanKey, ScanStats
-from .store import VectorIndex, open_store, wait_ready
+from .store import VectorIndex, wait_ready
+from .strategies import open_store
 
 log = logging.getLogger(__name__)
 

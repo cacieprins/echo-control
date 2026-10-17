@@ -15,7 +15,8 @@ from . import config as config_mod
 from .config import Config
 from .errors import EchoControlError, UsageError
 from .players import play, play_mpv_continuous
-from .store import ChunkIndex, is_ready, open_store, wait_ready
+from .store import ChunkIndex, is_ready, wait_ready
+from .strategies import get_strategy, open_store
 
 Notify = Callable[[str], None]
 
@@ -67,7 +68,7 @@ def validate_vibe(req: VibeRequest, cfg: Config) -> None:
         raise UsageError("--from only applies to --wander and --orbit")
     if req.wander and req.shuffle:
         raise UsageError("--shuffle would undo the walk's ordering")
-    if req.wander and cfg.model.strategy != "chunks":
+    if req.wander and not get_strategy(cfg.model).supports_wander:
         raise UsageError('--wander and --orbit need [model] strategy = "chunks"')
     if not req.clean_query and not req.seed:
         raise UsageError(show_usage=True)
