@@ -7,6 +7,7 @@ import urllib.request
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from qdrant_client import QdrantClient, models
@@ -46,14 +47,14 @@ class Hit:
 class Candidate:
     """A possible next track: its payload, how close its intro is, and its vectors."""
 
-    payload: dict
+    payload: dict[str, Any]
     position: float
     intro_dir: np.ndarray | None
     mean: np.ndarray
     intro: np.ndarray
 
     @classmethod
-    def of(cls, payload: dict, position: float, vectors: dict) -> Candidate:
+    def of(cls, payload: dict[str, Any], position: float, vectors: dict[str, Any]) -> Candidate:
         d = vectors.get("intro_dir")
         return cls(
             payload,
@@ -82,7 +83,7 @@ def wait_ready(url: str, timeout: float) -> None:
         delay = min(delay * 2, 5)
 
 
-def _iter_payloads(client: QdrantClient, collection: str) -> Iterator[dict]:
+def _iter_payloads(client: QdrantClient, collection: str) -> Iterator[dict[str, Any]]:
     offset = None
     while True:
         points, offset = client.scroll(
@@ -94,7 +95,7 @@ def _iter_payloads(client: QdrantClient, collection: str) -> Iterator[dict]:
             break
 
 
-def _payloads(client: QdrantClient, collection: str, paths: list[str]) -> list[dict]:
+def _payloads(client: QdrantClient, collection: str, paths: list[str]) -> list[dict[str, Any]]:
     points = client.retrieve(collection, ids=[point_id(p) for p in paths], with_payload=True)
     return [pt.payload for pt in points if pt.payload]
 
@@ -108,9 +109,9 @@ def open_store(cfg: Config) -> Store | ChunkStore:
 
 class Store:
     def __init__(self, cfg: QdrantConfig):
-        self.cfg = cfg
-        self.collection = cfg.collection
-        self.client = QdrantClient(url=cfg.url, timeout=30)
+        self.cfg: QdrantConfig = cfg
+        self.collection: str = cfg.collection
+        self.client: QdrantClient = QdrantClient(url=cfg.url, timeout=30)
 
     def ensure(self, dim: int) -> None:
         if self.client.collection_exists(self.collection):
@@ -145,7 +146,7 @@ class Store:
             return 0
         return self.client.count(self.collection, exact=True).count
 
-    def upsert(self, path: str, vectors: list[list[float]], payload: dict) -> None:
+    def upsert(self, path: str, vectors: list[list[float]], payload: dict[str, Any]) -> None:
         self.client.upsert(
             self.collection,
             points=[models.PointStruct(id=point_id(path), vector=vectors, payload=payload)],
@@ -158,10 +159,10 @@ class Store:
                 points_selector=models.PointIdsList(points=[point_id(p) for p in paths]),
             )
 
-    def iter_payloads(self) -> Iterator[dict]:
+    def iter_payloads(self) -> Iterator[dict[str, Any]]:
         return _iter_payloads(self.client, self.collection)
 
-    def payloads(self, paths: list[str]) -> list[dict]:
+    def payloads(self, paths: list[str]) -> list[dict[str, Any]]:
         return _payloads(self.client, self.collection, paths)
 
     def search(self, vector: list[float], limit: int, share_weight: float = 0.0) -> list[Hit]:
@@ -176,16 +177,17 @@ class Store:
             with_payload=True,
             with_vectors=rerank,
         )
-        hits = []
+        hits: list[Hit] = []
         q = np.asarray(vector, dtype=np.float32)
         for p in res.points:
             score = p.score
+            pl = p.payload or {}
             if rerank:
                 sims = np.asarray(p.vector, dtype=np.float32) @ q
-                shares = np.asarray(p.payload.get("shares") or [1.0] * len(sims))
+                shares = np.asarray(pl.get("shares") or [1.0] * len(sims))
                 if len(shares) == len(sims):
                     score = float(np.max(sims * shares**share_weight))
-            hits.append(Hit(path=p.payload["path"], score=score, duration=p.payload.get("duration")))
+            hits.append(Hit(path=str(pl.get("path", "")), score=score, duration=pl.get("duration")))
         if rerank:
             hits.sort(key=lambda h: -h.score)
         return hits[:limit]
@@ -198,12 +200,12 @@ class ChunkStore:
     current track record and is redone on the next scan."""
 
     def __init__(self, cfg: QdrantConfig, sustain_windows: int = 1):
-        self.cfg = cfg
-        self.sustain_windows = sustain_windows
-        self.collection = cfg.collection
-        self.tracks = f"{cfg.collection}_tracks"
-        self.chunks = f"{cfg.collection}_chunks"
-        self.client = QdrantClient(url=cfg.url, timeout=30)
+        self.cfg: QdrantConfig = cfg
+        self.sustain_windows: int = sustain_windows
+        self.collection: str = cfg.collection
+        self.tracks: str = f"{cfg.collection}_tracks"
+        self.chunks: str = f"{cfg.collection}_chunks"
+        self.client: QdrantClient = QdrantClient(url=cfg.url, timeout=30)
 
     def ensure(self, dim: int) -> None:
         if self.client.collection_exists(self.tracks):
@@ -252,9 +254,9 @@ class ChunkStore:
         self,
         path: str,
         vectors: np.ndarray,
-        chunk_payloads: list[dict],
-        track_vectors: dict[str, list[float]],
-        track_payload: dict,
+        chunk_payloads: list[dict[str, Any]],
+        track_vectors: dict[str, Any],
+        track_payload: dict[str, Any],
     ) -> None:
         """track_vectors holds TRACK_VECTORS entries; a missing direction is left out."""
         self._delete_chunks([path])
@@ -289,19 +291,20 @@ class ChunkStore:
             )
             self._delete_chunks(paths)
 
-    def iter_payloads(self) -> Iterator[dict]:
+    def iter_payloads(self) -> Iterator[dict[str, Any]]:
         return _iter_payloads(self.client, self.tracks)
 
-    def payloads(self, paths: list[str]) -> list[dict]:
+    def payloads(self, paths: list[str]) -> list[dict[str, Any]]:
         return _payloads(self.client, self.tracks, paths)
 
-    def track(self, path: str) -> tuple[dict, dict[str, np.ndarray]] | None:
+    def track(self, path: str) -> tuple[dict[str, Any], dict[str, np.ndarray]] | None:
         points = self.client.retrieve(
             self.tracks, ids=[point_id(path)], with_payload=True, with_vectors=True
         )
         if not points:
             return None
-        vecs = {k: np.asarray(v, dtype=np.float32) for k, v in (points[0].vector or {}).items()}
+        pv = points[0].vector
+        vecs = {k: np.asarray(v, dtype=np.float32) for k, v in pv.items()} if isinstance(pv, dict) else {}
         return points[0].payload or {}, vecs
 
     def chunk_vectors(self, path: str) -> np.ndarray:
@@ -315,7 +318,7 @@ class ChunkStore:
             with_payload=["idx"],
             with_vectors=True,
         )
-        points.sort(key=lambda p: p.payload["idx"])
+        points.sort(key=lambda p: (p.payload or {}).get("idx", 0))
         return np.array([p.vector for p in points], dtype=np.float32)
 
     def intros_near(self, vector: np.ndarray, limit: int, exclude: list[str]) -> list[Candidate]:
@@ -334,7 +337,11 @@ class ChunkStore:
             with_payload=True,
             with_vectors=["intro", "intro_dir", "mean"],
         )
-        return [Candidate.of(p.payload or {}, p.score, p.vector or {}) for p in res.points]
+        out: list[Candidate] = []
+        for p in res.points:
+            if isinstance(p.vector, dict):
+                out.append(Candidate.of(p.payload or {}, p.score, p.vector))
+        return out
 
     def intros_of(self, vector: np.ndarray, paths: list[str]) -> list[Candidate]:
         """Like intros_near, for the given tracks rather than the nearest ones."""
@@ -344,12 +351,13 @@ class ChunkStore:
             with_payload=True,
             with_vectors=["intro", "intro_dir", "mean"],
         )
-        return [
-            Candidate.of(
-                p.payload or {}, float(np.asarray(p.vector["intro"], np.float32) @ vector), p.vector
-            )
-            for p in points
-        ]
+        out: list[Candidate] = []
+        for p in points:
+            if isinstance(p.vector, dict):
+                out.append(Candidate.of(
+                    p.payload or {}, float(np.asarray(p.vector["intro"], np.float32) @ vector), p.vector
+                ))
+        return out
 
     def sustained(self, vector: list[float], paths: list[str]) -> dict[str, float]:
         """search()'s score for each of the given tracks; tracks with no loud windows are left out."""
@@ -375,15 +383,15 @@ class ChunkStore:
         )
         return [
             Hit(
-                path=g.hits[0].payload["path"],
+                path=str((g.hits[0].payload or {}).get("path", "")),
                 score=float(np.mean([h.score for h in g.hits])),
                 duration=None,
-                start=g.hits[0].payload.get("start"),
+                start=(g.hits[0].payload or {}).get("start"),
             )
             for g in res.groups
         ]
 
-    def search(self, vector: list[float], limit: int, share_weight: float = 0.0) -> list[Hit]:
+    def search(self, vector: list[float], limit: int, _share_weight: float = 0.0) -> list[Hit]:
         """Tracks ranked by the mean similarity of their best sustain_windows non-silent
         windows, so a track has to hold the vibe for a while rather than for one lucky
         moment. Tracks with fewer windows are averaged over all of them. Candidates come from

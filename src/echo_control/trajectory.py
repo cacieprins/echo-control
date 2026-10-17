@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -64,7 +65,7 @@ def summarize(
     window_seconds: float,
     smooth: int = 5,
     k: float = 4.0,
-) -> dict:
+) -> dict[str, Any]:
     """Per-track trajectory features. Speeds are smoothed before looking for spikes (section
     changes) so CLAP's window-to-window jitter doesn't register as structure; a median
     filter would erase hard cuts, which move the embedding for only a sample or two."""

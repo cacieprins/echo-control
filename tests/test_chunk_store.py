@@ -1,4 +1,6 @@
 import uuid
+from collections.abc import Iterator
+from typing import Any
 
 import numpy as np
 import pytest
@@ -12,14 +14,22 @@ pytestmark = pytest.mark.skipif(not is_ready(URL), reason="no Qdrant on localhos
 
 
 @pytest.fixture
-def store():
+def store() -> Iterator[ChunkStore]:
     s = ChunkStore(QdrantConfig(url=URL, collection=f"test_{uuid.uuid4().hex[:8]}"))
     s.ensure(8)
     yield s
     s.drop()
 
 
-def _put(store, path, vecs, silent=None, intro=None, outro=None, payload=None):
+def _put(
+    store: ChunkStore,
+    path: str,
+    vecs: np.ndarray,
+    silent: list[bool] | None = None,
+    intro: list[float] | None = None,
+    outro: list[float] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> None:
     silent = silent or [False] * len(vecs)
     payloads = [
         {"path": path, "idx": i, "start": i * 2.5, "silent": s} for i, s in enumerate(silent)
@@ -32,7 +42,7 @@ def _put(store, path, vecs, silent=None, intro=None, outro=None, payload=None):
     )
 
 
-def test_wander_follows_outros_into_intros(store):
+def test_wander_follows_outros_into_intros(store: ChunkStore) -> None:
     from echo_control.config import WanderConfig
     from echo_control.wander import wander
 
@@ -47,7 +57,7 @@ def test_wander_follows_outros_into_intros(store):
     assert chain[1].position > 0.99
 
 
-def test_wander_skips_duplicates_and_silent_tracks(store):
+def test_wander_skips_duplicates_and_silent_tracks(store: ChunkStore) -> None:
     from echo_control.config import WanderConfig
     from echo_control.wander import wander
 
@@ -67,7 +77,7 @@ def test_wander_skips_duplicates_and_silent_tracks(store):
     assert [t.path for t in chain] == ["/a", "/same-album", "/b"]
 
 
-def test_search_groups_by_track_and_skips_silence(store):
+def test_search_groups_by_track_and_skips_silence(store: ChunkStore) -> None:
     eye = np.eye(8, dtype=np.float32)
     _put(store, "/a", eye[[0, 1, 2]])
     _put(store, "/b", eye[[3, 4]], silent=[False, True])
@@ -78,7 +88,7 @@ def test_search_groups_by_track_and_skips_silence(store):
     assert len({h.path for h in hits}) == len(hits)
 
 
-def test_orbit_pulls_back_toward_the_center(store):
+def test_orbit_pulls_back_toward_the_center(store: ChunkStore) -> None:
     from echo_control.config import WanderConfig
     from echo_control.wander import Orbit, wander
 
@@ -96,7 +106,7 @@ def test_orbit_pulls_back_toward_the_center(store):
     assert chain[1].center > 0.99
 
 
-def test_sustained_match_beats_one_lucky_window(store):
+def test_sustained_match_beats_one_lucky_window(store: ChunkStore) -> None:
     q = np.eye(8, dtype=np.float32)[0]
     other = np.eye(8, dtype=np.float32)[1]
     near = (0.8 * q + 0.6 * other)[None]
@@ -110,7 +120,7 @@ def test_sustained_match_beats_one_lucky_window(store):
     assert abs(hits[0].score - 0.8) < 0.02 and abs(hits[1].score - 0.25) < 0.02
 
 
-def test_replace_shrinks_and_delete_removes(store):
+def test_replace_shrinks_and_delete_removes(store: ChunkStore) -> None:
     eye = np.eye(8, dtype=np.float32)
     _put(store, "/a", eye[[0, 1, 2]])
     _put(store, "/a", eye[[5]])

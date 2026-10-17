@@ -14,6 +14,8 @@ import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from types import FrameType
+from typing import Any
 
 from .config import DATA_DIR, PlayerConfig, socket_path
 
@@ -82,7 +84,10 @@ def play_mpv(paths: list[str], title: str, detach: bool) -> None:
 class _MpvIpc:
     """Just enough of mpv's JSON IPC to read properties and append files."""
 
-    def __init__(self, path: Path, proc: subprocess.Popen, timeout: float = 15.0):
+    def __init__(self, path: Path, proc: subprocess.Popen[Any], timeout: float = 15.0):
+        self.sock: socket.socket
+        self.buf: bytes = b""
+        self.next_id: int = 0
         deadline = time.monotonic() + timeout
         while True:
             try:
@@ -94,10 +99,8 @@ class _MpvIpc:
                 if proc.poll() is not None or time.monotonic() > deadline:
                     raise PlayerError("mpv exited before its IPC socket came up") from None
                 time.sleep(0.1)
-        self.buf = b""
-        self.next_id = 0
 
-    def command(self, *args):
+    def command(self, *args: Any) -> Any:
         self.next_id += 1
         rid = self.next_id
         self.sock.sendall(json.dumps({"command": list(args), "request_id": rid}).encode() + b"\n")
@@ -115,7 +118,7 @@ class _MpvIpc:
                 return msg.get("data")
 
 
-def _interrupt(_signum, _frame) -> None:
+def _interrupt(_signum: int, _frame: FrameType | None) -> None:
     raise KeyboardInterrupt
 
 
@@ -195,8 +198,7 @@ def play_spotatui(paths: list[str], title: str, cfg: PlayerConfig, detach: bool)
 
     print(f"playlist folder: {folder}", file=sys.stderr)
     print(
-        "open it in spotatui: press d, choose Local Files, then pick the folder "
-        f"(spotatui's local_music_path must include {root})",
+        f"open it in spotatui: press d, choose Local Files, then pick the folder (spotatui's local_music_path must include {root})",
         file=sys.stderr,
     )
     if not detach and sys.stdout.isatty() and shutil.which("spotatui"):

@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      # The locked torch is the multi-GB ROCm build; CI swaps in the CPU build of the same
+      # version, and `uv run` must not sync it back.
+      UV_NO_SYNC: "1"
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.19.1
+        ports:
+          - 6333:6333
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: |
+          uv sync --frozen --no-install-package torch --no-install-package triton-rocm
+          uv pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: ruff and basedpyright
+        run: uv run pre-commit run --all-files
+
+      - name: Wait for Qdrant
+        run: |
+          for _ in $(seq 60); do
+            curl -fsS http://localhost:6333/readyz && exit 0
+            sleep 1
+          done
+          echo "Qdrant did not become ready" >&2
+          exit 1
+
+      - name: pytest
+        run: uv run pytest

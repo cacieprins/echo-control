@@ -3,12 +3,14 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 
 from .config import ModelConfig
-from .segments import Windows, dense_chunks, sliding_chunks, summarize
+from .segments import Windows, dense_chunks, normalize, sliding_chunks, summarize
 
 log = logging.getLogger(__name__)
 
@@ -63,7 +65,7 @@ def _librosa_windows(path: Path, windows: int, win: float) -> tuple[list[np.ndar
         return _split_short(audio, windows, win), duration
 
     starts = _window_starts(duration, windows, win)
-    clips = []
+    clips: list[np.ndarray] = []
     for start in starts:
         audio, _ = librosa.load(
             str(path), sr=SAMPLE_RATE, mono=True, offset=float(start), duration=win
@@ -126,22 +128,26 @@ class TextEncoder:
         import transformers
         from transformers import ClapProcessor, ClapTextModelWithProjection
 
-        self.cfg = cfg
-        self.torch = torch
+        self.cfg: ModelConfig = cfg
+        self.torch: Any = torch
         verbosity = transformers.logging.get_verbosity()
         transformers.logging.set_verbosity_error()  # the unused audio weights get a report
         try:
-            self.processor = ClapProcessor.from_pretrained(cfg.name)
-            self.model = ClapTextModelWithProjection.from_pretrained(cfg.name).eval()
+            self.processor: ClapProcessor = ClapProcessor.from_pretrained(cfg.name)  # pyright: ignore[reportUnknownMemberType]
+            self.model: ClapTextModelWithProjection = (
+                ClapTextModelWithProjection.from_pretrained(cfg.name).eval()  # pyright: ignore[reportUnknownMemberType]
+            )
         finally:
             transformers.logging.set_verbosity(verbosity)
-        self.dim = int(self.model.config.projection_dim)
+        self.dim: int = int(self.model.config.projection_dim)
 
     def embed_text(self, text: str) -> list[float]:
-        inputs = self.processor(text=[prompt(self.cfg, text)], return_tensors="pt", padding=True)
+        inputs = cast(Mapping[str, Any], self.processor(
+            text=[prompt(self.cfg, text)], return_tensors="pt", padding=True  # pyright: ignore[reportCallIssue]
+        ))
         with self.torch.inference_mode():
             emb = self.model(**inputs).text_embeds
-        return Clap._normalize(emb.float().numpy())[0].tolist()
+        return normalize(emb.float().numpy())[0].tolist()
 
 
 class Clap:
@@ -151,30 +157,28 @@ class Clap:
         import torch
         from transformers import ClapModel, ClapProcessor
 
-        self.cfg = cfg
-        self.device = device or resolve_devices(cfg.device)[0]
-        self.lock = threading.Lock()
+        self.cfg: ModelConfig = cfg
+        self.device: str = device or resolve_devices(cfg.device)[0]
+        self.lock: threading.Lock = threading.Lock()
         log.info("loading %s on %s", cfg.name, self.device)
-        self.torch = torch
-        self.processor = ClapProcessor.from_pretrained(cfg.name)
-        self.model = ClapModel.from_pretrained(cfg.name).to(self.device).eval()
-        self.dim = int(self.model.config.projection_dim)
+        self.torch: Any = torch
+        self.processor: ClapProcessor = ClapProcessor.from_pretrained(cfg.name)  # pyright: ignore[reportUnknownMemberType]
+        self.model: ClapModel = ClapModel.from_pretrained(cfg.name).to(self.device).eval()  # pyright: ignore[reportArgumentType, reportUnknownMemberType]
+        self.dim: int = int(self.model.config.projection_dim)
+        self._mel_fb: Any = None
+        self._window: Any = None
 
     @staticmethod
-    def _features(out) -> np.ndarray:
+    def _features(out: Any) -> np.ndarray:
         # transformers >= 5 wraps projected embeddings in a model output
         tensor = out if hasattr(out, "cpu") else out.pooler_output
         return tensor.detach().float().cpu().numpy()
-
-    @staticmethod
-    def _normalize(v: np.ndarray) -> np.ndarray:
-        return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-12)
 
     def _gpu_features_supported(self) -> bool:
         fe = self.processor.feature_extractor
         return fe.truncation == "rand_trunc" and fe.padding == "repeatpad"
 
-    def _log_mel(self, clips: list[np.ndarray]) -> dict:
+    def _log_mel(self, clips: list[np.ndarray]) -> dict[str, Any]:
         """Same features as ClapFeatureExtractor (rand_trunc + repeatpad), computed with
         torch.stft on the model's device instead of numpy on the CPU."""
         torch = self.torch
@@ -186,7 +190,7 @@ class Clap:
             if 0 < len(clip) < max_len:
                 clip = np.tile(clip, max_len // len(clip))
             batch[i, : len(clip)] = clip
-        if not hasattr(self, "_mel_fb"):
+        if self._mel_fb is None:
             self._mel_fb = torch.from_numpy(fe.mel_filters_slaney.astype(np.float32)).to(self.device)
             self._window = torch.hann_window(fe.fft_window_size, periodic=True, device=self.device)
         x = torch.from_numpy(batch).to(self.device)
@@ -207,7 +211,7 @@ class Clap:
         }
 
     def embed_clips(self, clips: list[np.ndarray]) -> np.ndarray:
-        out = []
+        out: list[np.ndarray] = []
         bs = max(self.cfg.batch_size, 1)
         gpu_features = self._gpu_features_supported()
         # fp16 overflows to NaN in this model; bf16 matches fp32 to cosine > 0.999.
@@ -222,12 +226,12 @@ class Clap:
                 if gpu_features:
                     inputs = self._log_mel(batch)
                 else:
-                    inputs = self.processor(
-                        audio=batch, sampling_rate=SAMPLE_RATE, return_tensors="pt"
-                    ).to(self.device)
-                emb = self.model.get_audio_features(**inputs)
+                    inputs = cast(Mapping[str, Any], self.processor(  # pyright: ignore[reportUnknownMemberType]
+                        audio=batch, sampling_rate=SAMPLE_RATE, return_tensors="pt"  # pyright: ignore[reportCallIssue]
+                    ).to(self.device))
+                emb = cast(object, self.model.get_audio_features(**inputs))  # pyright: ignore[reportUnknownMemberType]
             out.append(self._features(emb))
-        return self._normalize(np.concatenate(out))
+        return normalize(np.concatenate(out))
 
     @property
     def signature(self) -> str:
@@ -258,7 +262,7 @@ class Clap:
         embs = self.embed_clips(clips)
         c = self.cfg
         if c.strategy == "mean":
-            return [self._normalize(embs.mean(axis=0)).tolist()], [1.0]
+            return [normalize(embs.mean(axis=0)).tolist()], [1.0]
         centroids, shares = summarize(
             embs, c.max_clusters, c.min_cluster_share, c.merge_threshold
         )

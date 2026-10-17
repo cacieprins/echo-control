@@ -5,6 +5,7 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "echo-control"
 CONFIG_PATH = CONFIG_DIR / "config.toml"
@@ -20,7 +21,7 @@ _DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$")
 _UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
-def parse_duration(value: str | int | float) -> float:
+def parse_duration(value: str | float) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     m = _DURATION_RE.match(value)
@@ -103,7 +104,7 @@ class Config:
 
 def load(path: Path | None = None) -> Config:
     path = path or Path(os.environ.get("ECHO_CONTROL_CONFIG", CONFIG_PATH))
-    raw: dict = {}
+    raw: dict[str, Any] = {}
     if path.exists():
         with path.open("rb") as f:
             raw = tomllib.load(f)
