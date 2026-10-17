@@ -408,3 +408,46 @@ def test_daemon_handler_and_request_edge_cases(
     t.start()
     assert daemon.request({"op": "status"}, timeout=2.0) is None
     t.join()
+
+
+def test_errors_hierarchy_and_cli_exit_codes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from echo_control import store
+    from echo_control.errors import ConfigError, EchoControlError, UsageError
+    from echo_control.segments import SAMPLE_RATE, ffmpeg_decode_cmd
+
+    assert issubclass(UsageError, EchoControlError)
+    assert issubclass(ConfigError, EchoControlError)
+    assert issubclass(players.PlayerError, EchoControlError)
+    assert issubclass(store.QdrantUnavailable, EchoControlError)
+    assert UsageError("bad flag").exit_code == 2
+    assert ConfigError("bad config").exit_code == 1
+    assert players.PlayerError("no mpv").exit_code == 1
+    assert store.QdrantUnavailable("down").exit_code == 1
+
+    assert ffmpeg_decode_cmd(Path("/x.mp3"), "s16le") == [
+        "ffmpeg",
+        "-nostdin",
+        "-v",
+        "error",
+        "-i",
+        "/x.mp3",
+        "-ac",
+        "1",
+        "-ar",
+        str(SAMPLE_RATE),
+        "-f",
+        "s16le",
+        "-",
+    ]
+
+    def raise_config_error() -> Config:
+        raise ConfigError("broken toml")
+
+    monkeypatch.setattr(config, "load", raise_config_error)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["status"])
+    assert exc.value.code == 1
+    assert "error: broken toml" in capsys.readouterr().err
+

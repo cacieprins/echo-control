@@ -15,7 +15,7 @@ import numpy as np
 from . import trajectory
 from .clap import Clap
 from .config import Config
-from .segments import Windows
+from .segments import Windows, normalize
 from .store import ChunkStore, Store
 
 log = logging.getLogger(__name__)
@@ -146,8 +146,7 @@ class Indexer:
             for i, (start, end) in enumerate(spans)
         ]
         loud = ~np.array(windows.silent)
-        mean = vectors[loud].mean(axis=0) if loud.any() else vectors.mean(axis=0)
-        mean /= max(float(np.linalg.norm(mean)), 1e-12)
+        mean = normalize(vectors[loud].mean(axis=0) if loud.any() else vectors.mean(axis=0))
         intro, outro = trajectory.edges(
             vectors, starts, windows.silent, windows.db, self.cfg.model.edge_seconds
         )

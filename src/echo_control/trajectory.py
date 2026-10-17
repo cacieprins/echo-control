@@ -7,6 +7,8 @@ from typing import Any
 
 import numpy as np
 
+from .segments import normalize
+
 MAD_SCALE = 1.4826
 # Windows this far below the track's median loudness at either end count as fade.
 FADE_DB = 12.0
@@ -116,12 +118,8 @@ class Edge:
     drift: float
 
 
-def _unit(v: np.ndarray) -> np.ndarray:
-    return v / max(float(np.linalg.norm(v)), 1e-12)
-
-
 def _edge(vecs: np.ndarray, t: np.ndarray) -> Edge:
-    position = _unit(vecs.mean(axis=0))
+    position = normalize(vecs.mean(axis=0))
     if len(vecs) < 3:
         return Edge(position, None, 0.0)
     # Least-squares slope of the vectors over time, projected onto the sphere's tangent

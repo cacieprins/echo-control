@@ -10,16 +10,25 @@ from typing import Any, cast
 import numpy as np
 
 from .config import ModelConfig
-from .segments import Windows, dense_chunks, normalize, sliding_chunks, summarize
+from .segments import (
+    SAMPLE_RATE,
+    Windows,
+    dense_chunks,
+    ffmpeg_decode_cmd,
+    normalize,
+    sliding_chunks,
+    summarize,
+)
 
 log = logging.getLogger(__name__)
 
-SAMPLE_RATE = 48_000
+INTRO_START_FRAC = 0.10
+OUTRO_END_FRAC = 0.85
 
 
 def _window_starts(duration: float, windows: int, win: float) -> np.ndarray:
     # Skip intros/outros: sample evenly between 10% and 85% of the track.
-    return np.linspace(duration * 0.10, duration * 0.85 - win, windows)
+    return np.linspace(duration * INTRO_START_FRAC, duration * OUTRO_END_FRAC - win, windows)
 
 
 def _split_short(audio: np.ndarray, windows: int, win: float) -> list[np.ndarray]:
@@ -31,8 +40,7 @@ def _split_short(audio: np.ndarray, windows: int, win: float) -> list[np.ndarray
 def _ffmpeg_windows(path: Path, windows: int, win: float) -> tuple[list[np.ndarray], float]:
     """Fallback for files libsndfile rejects (broken MP3 headers, odd containers)."""
     out = subprocess.run(
-        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-ac", "1",
-         "-ar", str(SAMPLE_RATE), "-f", "f32le", "-"],
+        ffmpeg_decode_cmd(path, "f32le"),
         stdin=subprocess.DEVNULL,
         capture_output=True,
         check=True,

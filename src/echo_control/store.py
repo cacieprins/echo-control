@@ -13,13 +13,14 @@ import numpy as np
 from qdrant_client import QdrantClient, models
 
 from .config import Config, QdrantConfig
+from .errors import EchoControlError
 
 log = logging.getLogger(__name__)
 
 _NS = uuid.UUID("5f0c7c1e-6d7a-4f55-9d0e-6563686f6374")
 
 
-class QdrantUnavailable(RuntimeError):
+class QdrantUnavailable(EchoControlError):
     pass
 
 

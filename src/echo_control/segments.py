@@ -31,14 +31,31 @@ def rms_db(chunk: np.ndarray) -> float:
     return 20 * math.log10(max(rms, 1e-10))
 
 
+def ffmpeg_decode_cmd(path: Path, fmt: str = "f32le") -> list[str]:
+    return [
+        "ffmpeg",
+        "-nostdin",
+        "-v",
+        "error",
+        "-i",
+        str(path),
+        "-ac",
+        "1",
+        "-ar",
+        str(SAMPLE_RATE),
+        "-f",
+        fmt,
+        "-",
+    ]
+
+
 class _DecodeFailed(RuntimeError):
     pass
 
 
 def _ffmpeg_stream(path: Path, n: int) -> Iterator[np.ndarray]:
     proc = subprocess.Popen(
-        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-ac", "1",
-         "-ar", str(SAMPLE_RATE), "-f", "f32le", "-"],
+        ffmpeg_decode_cmd(path, "f32le"),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -153,8 +170,7 @@ def to_int16(audio: np.ndarray) -> np.ndarray:
 
 def _ffmpeg_s16(path: Path) -> np.ndarray:
     proc = subprocess.Popen(
-        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-ac", "1",
-         "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"],
+        ffmpeg_decode_cmd(path, "s16le"),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,

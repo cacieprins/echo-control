@@ -18,15 +18,17 @@ from types import FrameType
 from typing import Any, Self
 
 from .config import DATA_DIR, PlayerConfig, socket_path
+from .errors import EchoControlError
 
 BACKENDS = ("mpv", "spotatui", "command", "stdout")
 CONTINUOUS_AHEAD = 3
+M3U_KEEP = 20
 # mpv only opens a window for a video track, and cover art counts as one; without this the
 # window closes on every track that has no art.
 MPV_WINDOW = ("--force-window=immediate",)
 
 
-class PlayerError(RuntimeError):
+class PlayerError(EchoControlError):
     pass
 
 
@@ -44,7 +46,7 @@ def write_m3u(paths: list[str], title: str) -> Path:
     fd, name = tempfile.mkstemp(prefix="vibe-", suffix=".m3u", dir=out)
     with os.fdopen(fd, "w") as f:
         f.write(m3u(paths, title))
-    for old in sorted(out.glob("vibe-*.m3u"), key=lambda p: p.stat().st_mtime)[:-20]:
+    for old in sorted(out.glob("vibe-*.m3u"), key=lambda p: p.stat().st_mtime)[:-M3U_KEEP]:
         old.unlink(missing_ok=True)
     return Path(name)
 

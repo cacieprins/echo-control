@@ -12,15 +12,19 @@ from pathlib import Path
 from typing import NoReturn
 
 from . import config as config_mod
-from .players import BACKENDS, PlayerError, play
-from .store import QdrantUnavailable, is_ready
+from .errors import EchoControlError, UsageError
+from .players import BACKENDS, play
+from .store import is_ready
 
 Handler = Callable[[config_mod.Config, argparse.Namespace], None]
 
 
-def _die(msg: str, code: int = 1) -> NoReturn:
-    print(f"error: {msg}", file=sys.stderr)
-    sys.exit(code)
+def _fail(err: EchoControlError, parser: argparse.ArgumentParser | None = None) -> NoReturn:
+    if isinstance(err, UsageError) and err.show_usage and parser is not None:
+        parser.print_usage(sys.stderr)
+    if str(err):
+        print(f"error: {err}", file=sys.stderr)
+    sys.exit(err.exit_code)
 
 
 def _contrib_dir() -> Path:
@@ -28,7 +32,7 @@ def _contrib_dir() -> Path:
     for candidate in (here / "contrib", here.parent.parent / "contrib"):
         if candidate.is_dir():
             return candidate
-    _die("contrib files not found in the installation")
+    raise EchoControlError("contrib files not found in the installation")
 
 
 def _embed_text(cfg: config_mod.Config, text: str) -> list[float]:
@@ -49,6 +53,113 @@ def _relative_dir(path: Path, roots: list[Path]) -> str:
             rel = path.parent.relative_to(root)
             return str(rel) if str(rel) != "." else root.name
     return str(path.parent)
+
+
+def _run_vibe(args: argparse.Namespace) -> None:
+    if args.limit is not None and args.limit <= 0:
+        raise UsageError("-n/--limit must be at least 1")
+    if args.orbit is not None:
+        if args.orbit < 0:
+            raise UsageError("--orbit strength can't be negative")
+        args.wander = True
+    if args.continuous:
+        args.wander = True
+        if args.json or args.print:
+            raise UsageError(
+                "--continuous plays in mpv; it can't be combined with --json or --print"
+            )
+    cfg = config_mod.load()
+    if args.continuous and (args.player or cfg.player.backend) != "mpv":
+        raise UsageError("--continuous needs the mpv player")
+
+    if args.play_path:
+        backend = args.player or cfg.player.backend
+        play(backend, args.play_path, Path(args.play_path[0]).stem, cfg.player, args.detach)
+        return
+
+    if len(args.query) > 1:
+        raise UsageError(f'put the query in quotes, e.g. vibe "{" ".join(args.query)}"')
+    if args.seed and not args.wander:
+        raise UsageError("--from only applies to --wander and --orbit")
+    if args.wander and args.shuffle:
+        raise UsageError("--shuffle would undo the walk's ordering")
+    if args.wander and cfg.model.strategy != "chunks":
+        raise UsageError('--wander and --orbit need [model] strategy = "chunks"')
+    query = args.query[0].strip() if args.query else ""
+    if not query and not args.seed:
+        raise UsageError(show_usage=True)
+
+    if not is_ready(cfg.qdrant.url):
+        raise EchoControlError(
+            f"Qdrant not reachable at {cfg.qdrant.url} (systemctl --user start echo-control)"
+        )
+
+    from .store import open_store
+
+    store = open_store(cfg)
+    if not store.exists():
+        raise EchoControlError("the index is empty; start the daemon or run `echo-control scan`")
+
+    limit = args.limit if args.limit is not None else cfg.player.limit
+    vector = None
+    if query:
+        try:
+            vector = _embed_text(cfg, query)
+        except RuntimeError as e:
+            raise EchoControlError(f"embedding failed: {e}") from e
+    scores = []
+    if args.seed:
+        seed = str(Path(args.seed).expanduser().resolve())
+    else:
+        assert vector is not None
+        hits = store.search(vector, 1 if args.wander else limit, cfg.search.share_weight)
+        if args.wander and not hits:
+            raise EchoControlError("nothing matched to start wandering from")
+        seed = hits[0].path if hits else ""
+        scores = [(h.path, h.score) for h in hits]
+    if args.wander:
+        from .store import ChunkStore
+        from .wander import Orbit, walk, wander
+
+        assert isinstance(store, ChunkStore)
+
+        found = store.track(seed)
+        if found is None:
+            raise EchoControlError(f"{seed} isn't in the chunk index")
+        orbit = None
+        if args.orbit is not None and args.orbit > 0:
+            orbit = Orbit(vector or found[1]["mean"].tolist(), args.orbit)
+        if args.continuous:
+            from .players import play_mpv_continuous
+
+            steps = (t.path for t in walk(store, seed, cfg.wander, orbit))
+            play_mpv_continuous(steps, query or f"wander from {Path(seed).stem}", args.detach)
+            return
+        chain = wander(store, seed, limit, cfg.wander, orbit)
+        scores = [(t.path, t.score) for t in chain]
+
+    if args.json:
+        out = [
+            {
+                "path": path,
+                "name": Path(path).stem,
+                "dir": _relative_dir(Path(path), cfg.library.paths),
+                "score": round(score, 4),
+            }
+            for path, score in scores
+        ]
+        json.dump(out, sys.stdout)
+        sys.stdout.write("\n")
+        return
+
+    paths = [path for path, _ in scores]
+    if args.shuffle:
+        random.shuffle(paths)
+    if args.print or not (sys.stdout.isatty() or args.detach or args.player):
+        backend = "stdout"
+    else:
+        backend = args.player or cfg.player.backend
+    play(backend, paths, query or f"wander from {Path(seed).stem}", cfg.player, args.detach)
 
 
 def vibe(argv: list[str] | None = None) -> None:
@@ -85,115 +196,12 @@ def vibe(argv: list[str] | None = None) -> None:
         help="keep wandering (or orbiting) forever in mpv, queueing tracks as they play",
     )
     args = p.parse_args(argv)
-    if args.limit is not None and args.limit <= 0:
-        _die("-n/--limit must be at least 1", 2)
-    if args.orbit is not None:
-        if args.orbit < 0:
-            _die("--orbit strength can't be negative", 2)
-        args.wander = True
-    if args.continuous:
-        args.wander = True
-        if args.json or args.print:
-            _die("--continuous plays in mpv; it can't be combined with --json or --print", 2)
-    cfg = config_mod.load()
-    if args.continuous and (args.player or cfg.player.backend) != "mpv":
-        _die("--continuous needs the mpv player", 2)
-
-    if args.play_path:
-        backend = args.player or cfg.player.backend
-        try:
-            play(backend, args.play_path, Path(args.play_path[0]).stem, cfg.player, args.detach)
-        except PlayerError as e:
-            _die(str(e))
-        return
-
-    if len(args.query) > 1:
-        _die(f'put the query in quotes, e.g. vibe "{" ".join(args.query)}"', 2)
-    if args.seed and not args.wander:
-        _die("--from only applies to --wander and --orbit", 2)
-    if args.wander and args.shuffle:
-        _die("--shuffle would undo the walk's ordering", 2)
-    if args.wander and cfg.model.strategy != "chunks":
-        _die('--wander and --orbit need [model] strategy = "chunks"', 2)
-    query = args.query[0].strip() if args.query else ""
-    if not query and not args.seed:
-        p.print_usage(sys.stderr)
-        sys.exit(2)
-
-    if not is_ready(cfg.qdrant.url):
-        _die(f"Qdrant not reachable at {cfg.qdrant.url} (systemctl --user start echo-control)")
-
-    from .store import open_store
-
-    store = open_store(cfg)
-    if not store.exists():
-        _die("the index is empty; start the daemon or run `echo-control scan`")
-
-    limit = args.limit if args.limit is not None else cfg.player.limit
-    vector = None
-    if query:
-        try:
-            vector = _embed_text(cfg, query)
-        except RuntimeError as e:
-            _die(f"embedding failed: {e}")
-    scores = []
-    if args.seed:
-        seed = str(Path(args.seed).expanduser().resolve())
-    else:
-        assert vector is not None
-        hits = store.search(vector, 1 if args.wander else limit, cfg.search.share_weight)
-        if args.wander and not hits:
-            _die("nothing matched to start wandering from")
-        seed = hits[0].path if hits else ""
-        scores = [(h.path, h.score) for h in hits]
-    if args.wander:
-        from .store import ChunkStore
-        from .wander import Orbit, walk, wander
-        assert isinstance(store, ChunkStore)
-
-        found = store.track(seed)
-        if found is None:
-            _die(f"{seed} isn't in the chunk index")
-        orbit = None
-        if args.orbit is not None and args.orbit > 0:
-            orbit = Orbit(vector or found[1]["mean"].tolist(), args.orbit)
-        if args.continuous:
-            from .players import play_mpv_continuous
-
-            steps = (t.path for t in walk(store, seed, cfg.wander, orbit))
-            try:
-                play_mpv_continuous(steps, query or f"wander from {Path(seed).stem}", args.detach)
-            except PlayerError as e:
-                _die(str(e))
-            return
-        chain = wander(store, seed, limit, cfg.wander, orbit)
-        scores = [(t.path, t.score) for t in chain]
-
-    if args.json:
-        out = [
-            {
-                "path": path,
-                "name": Path(path).stem,
-                "dir": _relative_dir(Path(path), cfg.library.paths),
-                "score": round(score, 4),
-            }
-            for path, score in scores
-        ]
-        json.dump(out, sys.stdout)
-        sys.stdout.write("\n")
-        return
-
-    paths = [path for path, _ in scores]
-    if args.shuffle:
-        random.shuffle(paths)
-    if args.print or not (sys.stdout.isatty() or args.detach or args.player):
-        backend = "stdout"
-    else:
-        backend = args.player or cfg.player.backend
     try:
-        play(backend, paths, query or f"wander from {Path(seed).stem}", cfg.player, args.detach)
-    except PlayerError as e:
-        _die(str(e))
+        _run_vibe(args)
+    except EchoControlError as e:
+        _fail(e, p)
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 
 def cmd_daemon(cfg: config_mod.Config, _args: argparse.Namespace) -> None:
@@ -273,7 +281,7 @@ def _run(argv: list[str]) -> None:
     if out:
         print(out)
     if r.returncode != 0:
-        _die(f"{argv[0]} exited with {r.returncode}")
+        raise EchoControlError(f"{argv[0]} exited with {r.returncode}")
 
 
 def cmd_install_service(_cfg: config_mod.Config, _args: argparse.Namespace) -> None:
@@ -308,7 +316,7 @@ def cmd_install_service(_cfg: config_mod.Config, _args: argparse.Namespace) -> N
 
 def cmd_install_noctalia(_cfg: config_mod.Config, _args: argparse.Namespace) -> None:
     if not shutil.which("noctalia"):
-        _die("noctalia is not installed")
+        raise EchoControlError("noctalia is not installed")
     source = _contrib_dir() / "noctalia"
     r = subprocess.run(
         ["noctalia", "msg", "plugins", "source", "list"], capture_output=True, text=True, check=False
@@ -331,18 +339,18 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("install-noctalia", help="register and enable the Noctalia launcher plugin")
     args = p.parse_args(argv)
 
-    cfg = config_mod.load()
-    handler: Handler = {
-        "daemon": cmd_daemon,
-        "scan": cmd_scan,
-        "reindex": cmd_reindex,
-        "status": cmd_status,
-        "install-service": cmd_install_service,
-        "install-noctalia": cmd_install_noctalia,
-    }[args.cmd]
     try:
+        cfg = config_mod.load()
+        handler: Handler = {
+            "daemon": cmd_daemon,
+            "scan": cmd_scan,
+            "reindex": cmd_reindex,
+            "status": cmd_status,
+            "install-service": cmd_install_service,
+            "install-noctalia": cmd_install_noctalia,
+        }[args.cmd]
         handler(cfg, args)
-    except QdrantUnavailable as e:
-        _die(str(e))
+    except EchoControlError as e:
+        _fail(e, p)
     except KeyboardInterrupt:
         sys.exit(130)
