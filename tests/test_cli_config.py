@@ -698,5 +698,120 @@ def test_strategies_and_indexer_scan_with_fakes(
         assert pl["embedding"] == get_strategy(strat_name).signature(cfg_mv.model)
 
 
+def test_daemon_collaborators_and_handle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import json
+    import socket
+    import threading
+    from typing import Any
+
+    from echo_control import daemon
+    from echo_control.config import Config, LibraryConfig, ModelConfig, StrategyName
+    from echo_control.daemon import Daemon, DaemonState, PendingQueue
+    from echo_control.records import ScanStats
+    from tests.fakes import InMemoryVectorIndex
+
+    # 1. Test PendingQueue debouncing without sleep
+    now = 100.0
+    pq = PendingQueue(debounce_seconds=5.0, clock=lambda: now)
+    p1 = tmp_path / "a.mp3"
+    p2 = tmp_path / "b.mp3"
+    pq.mark_changed(p1)
+    now = 103.0
+    pq.mark_changed(p2)
+    assert len(pq) == 2
+    assert pq.take_ready() == []
+    # Re-touching p1 resets its debounce timer
+    pq.mark_changed(p1)
+    now = 107.0
+    assert pq.take_ready() == []
+    now = 108.5
+    assert pq.take_ready() == [p1, p2]
+    assert len(pq) == 0
+
+    # 2. Test DaemonState thread-safe status transitions
+    state = DaemonState(started=50.0)
+    assert state["scanning"] is False
+    state.set_scanning(True)
+    state.set_indexing(True)
+    state.record_scan(ScanStats(12, 4, 1), at=60.0)
+    snap = state.snapshot()
+    assert snap == {
+        "started": 50.0,
+        "scanning": True,
+        "indexing": True,
+        "last_scan": {"at": 60.0, "files": 12, "indexed": 4, "removed": 1},
+    }
+
+    # 3. Test Daemon.handle, mark_changed, and flush_pending with fake TextEmbedder and store
+    class FakeText:
+        dim: int = 4
+
+        def embed_text(self, text: str) -> list[float]:
+            return [float(len(text)), 0.0, 0.0, 0.0]
+
+    music_dir = tmp_path / "music"
+    music_dir.mkdir()
+    song = music_dir / "track.mp3"
+    song.write_bytes(b"audio")
+    deleted_song = music_dir / "gone.mp3"
+
+    cfg = Config(
+        library=LibraryConfig(paths=[music_dir], extensions=["mp3"]),
+        model=ModelConfig(name="test-clap", device="cpu", strategy=StrategyName.CLUSTERS),
+    )
+    store = InMemoryVectorIndex()
+    store.ensure(4)
+    store.upsert(str(deleted_song), [[1.0, 0.0, 0.0, 0.0]], {"path": str(deleted_song)})
+
+    d = Daemon(cfg, text=FakeText(), store=store, pending=pq)
+    d.mark_changed(song)
+    d.mark_changed(deleted_song)
+    d.mark_changed(tmp_path / "outside.mp3")  # ignored by is_audio
+    assert len(d.pending) == 2
+
+    assert d.handle({"op": "embed", "text": "hi"}) == {"vector": [2.0, 0.0, 0.0, 0.0]}
+    st_resp = d.handle({"op": "status"})
+    assert st_resp["pending"] == 2
+    assert st_resp["model"] == "test-clap"
+    assert st_resp["strategy"] == "clusters"
+    assert st_resp["indexed"] == 1
+    assert d.handle({"op": "bogus"}) == {"error": "unknown op 'bogus'"}
+
+    jobs_run: list[list[Path] | None] = []
+
+    def fake_run_job(paths: list[Path] | None) -> Any:
+        jobs_run.append(paths)
+        return 1
+
+    monkeypatch.setattr(d, "_run_job", fake_run_job)
+    now = 200.0
+    d.flush_pending()
+    assert store.count() == 0  # deleted_song was pruned
+    assert jobs_run == [[song]]
+
+    # 4. Test request() raising RuntimeError when daemon returns {"error": ...}
+    sock_file = tmp_path / "err.sock"
+    monkeypatch.setattr(daemon, "socket_path", lambda: sock_file)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_file))
+    srv.listen(1)
+
+    def serve_error() -> None:
+        conn, _ = srv.accept()
+        _ = conn.recv(1024)
+        conn.sendall(json.dumps({"error": "bad op"}).encode() + b"\n")
+        conn.close()
+        srv.close()
+
+    t = threading.Thread(target=serve_error)
+    t.start()
+    with pytest.raises(RuntimeError, match="bad op"):
+        daemon.request({"op": "bogus"}, timeout=2.0)
+    t.join()
+
+
+
 
 
