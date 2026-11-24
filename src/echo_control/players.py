@@ -204,6 +204,9 @@ def play_mpv_tui(
     title: str,
     art_provider: Callable[[str], Path | None] | None = None,
     ahead: int = CONTINUOUS_AHEAD,
+    on_commit: Callable[[str, str | None], None] | None = None,
+    commit_seconds: float = 30.0,
+    commit_fraction: float = 0.40,
 ) -> None:
     """Run mpv with its cover-art window while driving a Textual TUI in the terminal."""
     from .tui import MpvController, VibeApp
@@ -231,6 +234,9 @@ def play_mpv_tui(
                 is_alive=lambda: proc.poll() is None,
                 art_provider=art_provider,
                 ahead=ahead,
+                on_commit=on_commit,
+                commit_seconds=commit_seconds,
+                commit_fraction=commit_fraction,
             )
             app.run()
     except (ConnectionError, BrokenPipeError):

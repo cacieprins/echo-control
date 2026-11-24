@@ -173,6 +173,9 @@ def run_vibe(
 
     if req.wander:
         from .art import ensure_latent_art
+        from .config import CACHE_DIR, STATE_DIR
+        from .cooldown import CooldownScorer, HeatField, TrailLog
+        from .manifold import CorpusManifold
         from .players import play_mpv_tui
         from .tui import QueueEntry, VibeSession
         from .wander import Orbit, Transition, walk, wander
@@ -184,6 +187,19 @@ def run_vibe(
         orbit = None
         if req.orbit is not None and req.orbit > 0:
             orbit = Orbit(vector or found[1]["mean"].tolist(), req.orbit)
+
+        manifold = CorpusManifold.from_store(
+            store,
+            neighbors=cfg.wander.csls_neighbors,
+            cache_path=CACHE_DIR / f"manifold_{cfg.qdrant.collection}.npz",
+        )
+        trails = TrailLog.load(STATE_DIR / "trails.json", cfg.wander)
+        cooldown = CooldownScorer(
+            manifold=manifold,
+            heat_field=HeatField.from_config(cfg.wander),
+            trails=trails,
+            cfg=cfg.wander,
+        )
 
         use_tui = should_use_tui(req, cfg, is_tty=is_tty)
         title = query or f"wander from {Path(seed).stem}"
@@ -203,7 +219,7 @@ def run_vibe(
                         else:
                             center_vec = vector or found[1]["mean"].tolist()
                         orb = Orbit(center_vec, strength)
-                    return walk(store, from_path, cfg.wander, orb)
+                    return walk(store, from_path, cfg.wander, orb, cooldown=cooldown)
 
                 stream = _walk_factory(seed, req.orbit, None if vector is not None else seed)
                 session = VibeSession(
@@ -219,14 +235,24 @@ def run_vibe(
                     session,
                     title,
                     art_provider=lambda p: ensure_latent_art(p, store),
+                    on_commit=lambda p, prev: cooldown.commit_play(p, prev, persist=True),
+                    commit_seconds=cfg.wander.commit_seconds,
+                    commit_fraction=cfg.wander.commit_fraction,
                 )
                 return None
 
-            steps = (t.path for t in walk(store, seed, cfg.wander, orbit))
+            steps = (
+                t.path
+                for t in walk(
+                    store, seed, cfg.wander, orbit, cooldown=cooldown, update_heat_on_step=True
+                )
+            )
             play_mpv_continuous(steps, title, req.detach)
             return None
 
-        chain = wander(store, seed, limit, cfg.wander, orbit)
+        chain = wander(
+            store, seed, limit, cfg.wander, orbit, cooldown=cooldown, update_heat_on_step=True
+        )
         if use_tui:
             session = VibeSession(
                 entries=[QueueEntry.from_transition(t) for t in chain],
@@ -239,6 +265,9 @@ def run_vibe(
                 session,
                 title,
                 art_provider=lambda p: ensure_latent_art(p, store),
+                on_commit=lambda p, prev: cooldown.commit_play(p, prev, persist=True),
+                commit_seconds=cfg.wander.commit_seconds,
+                commit_fraction=cfg.wander.commit_fraction,
             )
             return None
         scores = [(t.path, t.score) for t in chain]

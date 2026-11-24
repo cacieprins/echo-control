@@ -17,6 +17,7 @@ import numpy as np
 
 from . import trajectory
 from .config import WanderConfig
+from .cooldown import CooldownScorer, sample_next
 from .store import Candidate, ChunkIndex
 
 DRIFT_EPS = 1e-4
@@ -32,6 +33,8 @@ class Transition:
     center: float = 0.0
     mean: np.ndarray | None = field(default=None, repr=False)
     intro: np.ndarray | None = field(default=None, repr=False)
+    heat: float = 0.0
+    csls: float = 0.0
 
     @property
     def position(self) -> float:
@@ -87,6 +90,7 @@ def rank_next(
     cfg: WanderConfig,
     orbit: Orbit | None = None,
     duplicates: Duplicates | None = None,
+    cooldown: CooldownScorer | None = None,
 ) -> list[Transition]:
     """Candidate follow-ups to the last played track, best first, leaving out anything
     played already or a duplicate of it. When orbiting, the tracks closest to the center
@@ -113,41 +117,83 @@ def rank_next(
     for c in cands:
         if duplicates(c, played):
             continue
+        cand_path = str(c.payload["path"])
         direction = (
             float(outro_dir @ c.intro_dir)
             if outro_dir is not None and c.intro_dir is not None
             else 0.0
         )
         drift = drift_match(outro_drift, float(c.payload.get("intro_drift") or 0.0))
-        center = near_center.get(c.payload["path"], 0.0)
+        center = near_center.get(cand_path, 0.0)
         score = cfg.position * c.intro_sim + cfg.direction * direction + cfg.drift * drift
         if orbit:
             score += orbit.strength * center
+        csls_term = 0.0
+        heat_term = 0.0
+        if cooldown is not None:
+            total_pen, csls_term, heat_term = cooldown.penalty(path, cand_path, c.mean)
+            score -= total_pen
         out.append(Transition(
-            c.payload["path"], score, c.intro_sim, direction, drift, center, c.mean, c.intro,
+            cand_path, score, c.intro_sim, direction, drift, center, c.mean, c.intro,
+            heat=heat_term,
+            csls=csls_term,
         ))
     out.sort(key=lambda t: -t.score)
     return out
 
 
 def walk(
-    store: ChunkIndex, seed: str, cfg: WanderConfig, orbit: Orbit | None = None
+    store: ChunkIndex,
+    seed: str,
+    cfg: WanderConfig,
+    orbit: Orbit | None = None,
+    cooldown: CooldownScorer | None = None,
+    *,
+    rng: np.random.Generator | None = None,
+    update_heat_on_step: bool = False,
 ) -> Iterator[Transition]:
-    """Greedy walk from seed, one step at a time, until nothing unplayed is left; the seed
+    """Walk from seed, one step at a time, until nothing unplayed is left; the seed
     comes first, with a score of 0."""
     found = store.track(seed)
     if found is None:
         raise KeyError(seed)
     _, vecs = found
     chain = [Transition(seed, 0.0, 0.0, 0.0, 0.0, mean=vecs["mean"], intro=vecs["intro"])]
+    if cooldown is not None and update_heat_on_step:
+        cooldown.commit_play(seed, None, vecs["mean"], persist=False)
     yield chain[0]
     duplicates = Duplicates(store, cfg)
-    while ranked := rank_next(store, chain, cfg, orbit, duplicates):
-        chain.append(ranked[0])
-        yield ranked[0]
+    while ranked := rank_next(store, chain, cfg, orbit, duplicates, cooldown):
+        picked = sample_next(ranked, cfg, rng) if cooldown is not None else ranked[0]
+        prev_path = chain[-1].path
+        chain.append(picked)
+        if cooldown is not None and update_heat_on_step:
+            cooldown.commit_play(picked.path, prev_path, picked.mean, persist=False)
+        yield picked
 
 
 def wander(
-    store: ChunkIndex, seed: str, length: int, cfg: WanderConfig, orbit: Orbit | None = None
+    store: ChunkIndex,
+    seed: str,
+    length: int,
+    cfg: WanderConfig,
+    orbit: Orbit | None = None,
+    cooldown: CooldownScorer | None = None,
+    *,
+    rng: np.random.Generator | None = None,
+    update_heat_on_step: bool = False,
 ) -> list[Transition]:
-    return list(itertools.islice(walk(store, seed, cfg, orbit), length))
+    return list(
+        itertools.islice(
+            walk(
+                store,
+                seed,
+                cfg,
+                orbit,
+                cooldown,
+                rng=rng,
+                update_heat_on_step=update_heat_on_step,
+            ),
+            length,
+        )
+    )

@@ -172,6 +172,25 @@ class InMemoryChunkIndex:
         chunks.sort(key=lambda c: c.payload.get("idx", 0))
         return np.array([c.vector for c in chunks], dtype=np.float32)
 
+    def all_track_vectors(self) -> tuple[list[str], np.ndarray, np.ndarray]:
+        rows: list[tuple[str, np.ndarray, np.ndarray]] = []
+        for path, rec in self._tracks.items():
+            if rec.payload.get("silent") is True:
+                continue
+            mean_v = rec.vectors.get("mean")
+            intro_v = rec.vectors.get("intro")
+            if mean_v is None or intro_v is None:
+                continue
+            rows.append((path, mean_v.astype(np.float32), intro_v.astype(np.float32)))
+        if not rows:
+            empty = np.empty((0, 0), dtype=np.float32)
+            return [], empty, empty
+        rows.sort(key=lambda r: r[0])
+        paths = [r[0] for r in rows]
+        means = np.stack([r[1] for r in rows], axis=0)
+        intros = np.stack([r[2] for r in rows], axis=0)
+        return paths, means, intros
+
     def intros_near(self, vector: np.ndarray, limit: int, exclude: list[str]) -> list[Candidate]:
         excluded = set(exclude)
         q = np.asarray(vector, dtype=np.float32)

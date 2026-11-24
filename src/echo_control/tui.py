@@ -338,6 +338,9 @@ class VibeApp(App[None]):
         art_provider: Callable[[str], Path | None] | None = None,
         meta_provider: Callable[[str], TrackMeta] = read_track_meta,
         ahead: int = CONTINUOUS_AHEAD,
+        on_commit: Callable[[str, str | None], None] | None = None,
+        commit_seconds: float = 30.0,
+        commit_fraction: float = 0.40,
     ) -> None:
         super().__init__()
         self.theme = "ansi-dark"
@@ -347,7 +350,12 @@ class VibeApp(App[None]):
         self.art_provider: Callable[[str], Path | None] | None = art_provider
         self.meta_provider: Callable[[str], TrackMeta] = meta_provider
         self.ahead: int = ahead
+        self.on_commit: Callable[[str, str | None], None] | None = on_commit
+        self.commit_seconds: float = commit_seconds
+        self.commit_fraction: float = commit_fraction
         self.state: PlaybackState = PlaybackState()
+        self._committed_indices: set[int] = set()
+        self._last_committed_path: str | None = None
 
     @override
     def compose(self) -> ComposeResult:
@@ -398,6 +406,17 @@ class VibeApp(App[None]):
                 )
             except _IPC_ERRORS as err:
                 _log.debug("cover art attach failed for %s: %s", current.path, err)
+
+            if self.on_commit is not None and pos not in self._committed_indices:
+                dur = self.state.duration
+                played_enough = self.state.time_pos >= self.commit_seconds or (
+                    dur > 0.0 and (self.state.time_pos / dur) >= self.commit_fraction
+                )
+                if played_enough:
+                    self._committed_indices.add(pos)
+                    prev_committed = self._last_committed_path
+                    self._last_committed_path = current.path
+                    self.on_commit(current.path, prev_committed)
 
         self._render_view()
 

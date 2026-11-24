@@ -348,3 +348,51 @@ def test_mpv_controller_handles_property_unavailable() -> None:
     assert state.duration == 0.0
     assert state.has_video is False
 
+
+def test_vibe_app_listen_time_commit_gate() -> None:
+    ipc = FakeIpc()
+    ipc.props["playlist-pos"] = 0
+    ipc.props["duration"] = 200.0
+    ipc.props["time-pos"] = 10.0  # < 30s and < 40%
+
+    committed: list[tuple[str, str | None]] = []
+    session = tui.VibeSession(
+        entries=[
+            tui.QueueEntry.from_transition(_t("track-a")),
+            tui.QueueEntry.from_transition(_t("track-b")),
+        ]
+    )
+    app = tui.VibeApp(
+        session=session,
+        controller=tui.MpvController(ipc),
+        is_alive=lambda: True,
+        on_commit=lambda path, prev: committed.append((path, prev)),
+        commit_seconds=30.0,
+        commit_fraction=0.40,
+    )
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Fast skip at 10s must NOT commit
+            assert committed == []
+
+            # Crossing 30s commits track-a once
+            ipc.props["time-pos"] = 31.0
+            app._refresh_from_mpv()  # pyright: ignore[reportPrivateUsage]
+            app._refresh_from_mpv()  # pyright: ignore[reportPrivateUsage]
+            assert committed == [("/music/track-a.flac", None)]
+
+            # Advance to short track-b (50s) and cross 40% (22s >= 20s)
+            ipc.props["playlist-pos"] = 1
+            ipc.props["duration"] = 50.0
+            ipc.props["time-pos"] = 22.0
+            app._refresh_from_mpv()  # pyright: ignore[reportPrivateUsage]
+            assert committed == [
+                ("/music/track-a.flac", None),
+                ("/music/track-b.flac", "/music/track-a.flac"),
+            ]
+
+    asyncio.run(_run())
+
+
