@@ -15,10 +15,13 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import FrameType
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
+
+if TYPE_CHECKING:
+    from .tui import VibeSession
 
 from .config import DATA_DIR, PlayerConfig, socket_path
 from .errors import EchoControlError
@@ -194,6 +197,52 @@ def play_mpv_continuous(
         sock.unlink(missing_ok=True)
         if detach:
             os._exit(0)
+
+
+def play_mpv_tui(
+    session: VibeSession,
+    title: str,
+    art_provider: Callable[[str], Path | None] | None = None,
+    ahead: int = CONTINUOUS_AHEAD,
+) -> None:
+    """Run mpv with its cover-art window while driving a Textual TUI in the terminal."""
+    from .tui import MpvController, VibeApp
+
+    if not shutil.which("mpv"):
+        raise PlayerError("mpv is not installed (pacman -S mpv), or pick another --player")
+    if session.continuous:
+        session.pull_ahead(0, ahead=ahead)
+    if not session.entries:
+        raise PlayerError("no results")
+
+    first = [e.path for e in session.entries]
+    sock = socket_path().with_name(f"vibe-mpv-{os.getpid()}.sock")
+    proc = subprocess.Popen(
+        _mpv_argv(first, title, detach=False, ipc_sock=sock),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    signal.signal(signal.SIGTERM, _interrupt)
+    try:
+        with _MpvIpc(sock, proc) as ipc:
+            app = VibeApp(
+                session=session,
+                controller=MpvController(ipc),
+                is_alive=lambda: proc.poll() is None,
+                art_provider=art_provider,
+                ahead=ahead,
+            )
+            app.run()
+    except (ConnectionError, BrokenPipeError):
+        pass
+    except KeyboardInterrupt:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait()
+        sock.unlink(missing_ok=True)
 
 
 def play_spotatui(paths: list[str], title: str, cfg: PlayerConfig, detach: bool) -> None:

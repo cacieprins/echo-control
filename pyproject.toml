@@ -12,6 +12,7 @@ dependencies = [
     "soundfile>=0.12",
     "qdrant-client>=1.12",
     "watchdog>=5.0",
+    "textual>=8.2.8",
 ]
 
 [project.optional-dependencies]

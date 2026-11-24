@@ -42,6 +42,7 @@ class VibeRequest:
     orbit: float | None = None
     seed: str | None = None
     continuous: bool = False
+    no_tui: bool = False
 
     @property
     def clean_query(self) -> str:
@@ -81,6 +82,18 @@ def choose_backend(req: VibeRequest, cfg: Config, *, is_tty: bool) -> str:
     if req.print_m3u or not (is_tty or req.detach or req.player):
         return "stdout"
     return req.player or cfg.player.backend
+
+
+def should_use_tui(req: VibeRequest, cfg: Config, *, is_tty: bool) -> bool:
+    return (
+        is_tty
+        and not req.no_tui
+        and not req.detach
+        and not req.print_m3u
+        and not req.as_json
+        and req.wander
+        and choose_backend(req, cfg, is_tty=is_tty) == "mpv"
+    )
 
 
 def relative_dir(path: Path, roots: list[Path]) -> str:
@@ -159,7 +172,10 @@ def run_vibe(
         scores = [(h.path, h.score) for h in hits]
 
     if req.wander:
-        from .wander import Orbit, walk, wander
+        from .art import ensure_latent_art
+        from .players import play_mpv_tui
+        from .tui import QueueEntry, VibeSession
+        from .wander import Orbit, Transition, walk, wander
 
         assert isinstance(store, ChunkIndex)
         found = store.track(seed)
@@ -168,11 +184,63 @@ def run_vibe(
         orbit = None
         if req.orbit is not None and req.orbit > 0:
             orbit = Orbit(vector or found[1]["mean"].tolist(), req.orbit)
+
+        use_tui = should_use_tui(req, cfg, is_tty=is_tty)
+        title = query or f"wander from {Path(seed).stem}"
+
         if req.continuous:
+            if use_tui:
+                def _walk_factory(
+                    from_path: str, strength: float | None, center_path: str | None
+                ) -> Iterator[Transition]:
+                    orb = None
+                    if strength is not None and strength > 0:
+                        if center_path is None and vector is not None:
+                            center_vec = vector
+                        elif center_path is not None:
+                            tr = store.track(center_path)
+                            center_vec = tr[1]["mean"].tolist() if tr is not None else found[1]["mean"].tolist()
+                        else:
+                            center_vec = vector or found[1]["mean"].tolist()
+                        orb = Orbit(center_vec, strength)
+                    return walk(store, from_path, cfg.wander, orb)
+
+                stream = _walk_factory(seed, req.orbit, None if vector is not None else seed)
+                session = VibeSession(
+                    entries=[],
+                    query=query,
+                    continuous=True,
+                    orbit_strength=req.orbit,
+                    orbit_center_path=seed if (req.orbit is not None and vector is None) else None,
+                    walk_factory=_walk_factory,
+                    stream=stream,
+                )
+                play_mpv_tui(
+                    session,
+                    title,
+                    art_provider=lambda p: ensure_latent_art(p, store),
+                )
+                return None
+
             steps = (t.path for t in walk(store, seed, cfg.wander, orbit))
-            play_mpv_continuous(steps, query or f"wander from {Path(seed).stem}", req.detach)
+            play_mpv_continuous(steps, title, req.detach)
             return None
+
         chain = wander(store, seed, limit, cfg.wander, orbit)
+        if use_tui:
+            session = VibeSession(
+                entries=[QueueEntry.from_transition(t) for t in chain],
+                query=query,
+                continuous=False,
+                orbit_strength=req.orbit,
+                orbit_center_path=seed if req.orbit is not None else None,
+            )
+            play_mpv_tui(
+                session,
+                title,
+                art_provider=lambda p: ensure_latent_art(p, store),
+            )
+            return None
         scores = [(t.path, t.score) for t in chain]
 
     if req.as_json:

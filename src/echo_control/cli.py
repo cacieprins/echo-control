@@ -54,6 +54,11 @@ def vibe(argv: list[str] | None = None) -> None:
         action="store_true",
         help="keep wandering (or orbiting) forever in mpv, queueing tracks as they play",
     )
+    p.add_argument(
+        "--no-tui",
+        action="store_true",
+        help="disable the TUI display and use plain mpv output",
+    )
     args = p.parse_args(argv)
     req = commands.VibeRequest(
         query=args.query,
@@ -68,6 +73,7 @@ def vibe(argv: list[str] | None = None) -> None:
         orbit=args.orbit,
         seed=args.seed,
         continuous=args.continuous,
+        no_tui=args.no_tui,
     )
     try:
         cfg = config_mod.load()
