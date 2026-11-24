@@ -21,6 +21,7 @@ from types import FrameType
 from typing import TYPE_CHECKING, Any, Self
 
 if TYPE_CHECKING:
+    from .playlog import DailyPlayLog
     from .tui import VibeSession
 
 from .config import DATA_DIR, PlayerConfig, socket_path
@@ -205,6 +206,7 @@ def play_mpv_tui(
     art_provider: Callable[[str], Path | None] | None = None,
     ahead: int = CONTINUOUS_AHEAD,
     on_commit: Callable[[str, str | None], None] | None = None,
+    play_log: DailyPlayLog | None = None,
     commit_seconds: float = 30.0,
     commit_fraction: float = 0.40,
 ) -> None:
@@ -235,6 +237,7 @@ def play_mpv_tui(
                 art_provider=art_provider,
                 ahead=ahead,
                 on_commit=on_commit,
+                play_log=play_log,
                 commit_seconds=commit_seconds,
                 commit_fraction=commit_fraction,
             )

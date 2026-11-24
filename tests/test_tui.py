@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, cast, override
+from typing import Any, override
 
 from echo_control import tui
 from echo_control.wander import Transition
@@ -317,17 +317,21 @@ def test_read_track_meta_and_app_display(monkeypatch: Any) -> None:
     )
 
     async def _check_ui() -> None:
-        from textual.widgets import DataTable, Static
+        from textual.widgets import Static
 
         async with app.run_test() as pilot:
             await pilot.pause()
+            assert len(app.query("DataTable")) == 0
             np_title = str(app.query_one("#np-title", Static).render())
             np_meta = str(app.query_one("#np-meta", Static).render())
+            next_title = str(app.query_one("#next-title", Static).render())
+            next_meta = str(app.query_one("#next-meta", Static).render())
             assert "VNV Nation — Saviour (Vox)" in np_title
             assert "Burning Empires" in np_meta
-            table = cast("DataTable[str]", app.query_one("#queue", DataTable))
-            assert table.get_row("0")[1] == "VNV Nation — Saviour (Vox)"
-            assert table.get_row("1")[1] == "no-tags"
+            assert next_title == "no-tags"
+            assert "score 0.85" in next_meta
+            assert "intro 0.82" in next_meta
+            assert "orbit 0.75" in next_meta
 
     asyncio.run(_check_ui())
 
@@ -349,13 +353,18 @@ def test_mpv_controller_handles_property_unavailable() -> None:
     assert state.has_video is False
 
 
-def test_vibe_app_listen_time_commit_gate() -> None:
+def test_vibe_app_listen_time_commit_gate(tmp_path: Path) -> None:
+    from textual.widgets import Static
+
+    from echo_control.playlog import DailyPlayLog
+
     ipc = FakeIpc()
     ipc.props["playlist-pos"] = 0
     ipc.props["duration"] = 200.0
     ipc.props["time-pos"] = 10.0  # < 30s and < 40%
 
     committed: list[tuple[str, str | None]] = []
+    play_log = DailyPlayLog(tmp_path / "logs")
     session = tui.VibeSession(
         entries=[
             tui.QueueEntry.from_transition(_t("track-a")),
@@ -367,6 +376,7 @@ def test_vibe_app_listen_time_commit_gate() -> None:
         controller=tui.MpvController(ipc),
         is_alive=lambda: True,
         on_commit=lambda path, prev: committed.append((path, prev)),
+        play_log=play_log,
         commit_seconds=30.0,
         commit_fraction=0.40,
     )
@@ -374,16 +384,20 @@ def test_vibe_app_listen_time_commit_gate() -> None:
     async def _run() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
-            # Fast skip at 10s must NOT commit
+            # Fast skip at 10s must NOT commit or write daily log
             assert committed == []
+            assert play_log.count_today() == 0
 
-            # Crossing 30s commits track-a once
+            # Crossing 30s commits track-a once and appends to daily log
             ipc.props["time-pos"] = 31.0
             app._refresh_from_mpv()  # pyright: ignore[reportPrivateUsage]
             app._refresh_from_mpv()  # pyright: ignore[reportPrivateUsage]
             assert committed == [("/music/track-a.flac", None)]
+            assert play_log.count_today() == 1
+            log_strip = str(app.query_one("#log-strip", Static).render())
+            assert "1 today" in log_strip
 
-            # Advance to short track-b (50s) and cross 40% (22s >= 20s)
+            # Advance to short track-b (50s) and cross 40% (22s >= 20s); also checks End of queue
             ipc.props["playlist-pos"] = 1
             ipc.props["duration"] = 50.0
             ipc.props["time-pos"] = 22.0
@@ -392,6 +406,13 @@ def test_vibe_app_listen_time_commit_gate() -> None:
                 ("/music/track-a.flac", None),
                 ("/music/track-b.flac", "/music/track-a.flac"),
             ]
+            assert play_log.count_today() == 2
+            assert str(app.query_one("#next-title", Static).render()) == "End of queue"
+
+            lines = play_log.path_for().read_text(encoding="utf-8").splitlines()
+            assert len(lines) == 2
+            assert "track-a" in lines[0] and "/music/track-a.flac" in lines[0]
+            assert "track-b" in lines[1] and "/music/track-b.flac" in lines[1]
 
     asyncio.run(_run())
 

@@ -17,9 +17,10 @@ from typing import Any, ClassVar, Protocol, cast, final, override
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.widgets import DataTable, Footer, ProgressBar, Static
+from textual.widgets import Footer, ProgressBar, Static
 
 from .errors import EchoControlError
+from .playlog import DailyPlayLog
 from .wander import Transition
 
 _log = logging.getLogger(__name__)
@@ -40,6 +41,8 @@ class QueueEntry:
     center: float = 0.0
     direction: float = 0.0
     drift: float = 0.0
+    heat: float = 0.0
+    csls: float = 0.0
 
     @classmethod
     def from_transition(cls, t: Transition) -> QueueEntry:
@@ -50,6 +53,8 @@ class QueueEntry:
             center=t.center,
             direction=t.direction,
             drift=t.drift,
+            heat=t.heat,
+            csls=t.csls,
         )
 
 
@@ -300,17 +305,26 @@ class VibeApp(App[None]):
     #np-status {
         color: $secondary;
     }
-    #queue {
-        height: 1fr;
+    #up-next {
+        height: auto;
+        padding: 0 1;
         border: solid $primary;
         border-title-color: $primary;
         background: transparent;
-        margin: 0 1;
+        margin: 1 1 0 1;
     }
-    #queue > .datatable--header {
-        background: transparent;
-        color: $secondary;
+    #next-title {
         text-style: bold;
+        color: $primary;
+    }
+    #next-meta {
+        color: $text-muted;
+    }
+    #log-strip {
+        height: auto;
+        padding: 0 2;
+        margin: 1 0 0 0;
+        color: $text-muted;
     }
     """
 
@@ -339,6 +353,7 @@ class VibeApp(App[None]):
         meta_provider: Callable[[str], TrackMeta] = read_track_meta,
         ahead: int = CONTINUOUS_AHEAD,
         on_commit: Callable[[str, str | None], None] | None = None,
+        play_log: DailyPlayLog | None = None,
         commit_seconds: float = 30.0,
         commit_fraction: float = 0.40,
     ) -> None:
@@ -351,11 +366,13 @@ class VibeApp(App[None]):
         self.meta_provider: Callable[[str], TrackMeta] = meta_provider
         self.ahead: int = ahead
         self.on_commit: Callable[[str, str | None], None] | None = on_commit
+        self.play_log: DailyPlayLog | None = play_log
         self.commit_seconds: float = commit_seconds
         self.commit_fraction: float = commit_fraction
         self.state: PlaybackState = PlaybackState()
         self._committed_indices: set[int] = set()
         self._last_committed_path: str | None = None
+        self._logged_today: int = play_log.count_today() if play_log is not None else 0
 
     @override
     def compose(self) -> ComposeResult:
@@ -364,15 +381,15 @@ class VibeApp(App[None]):
             yield Static("", id="np-meta")
             yield ProgressBar(total=100, show_eta=False, show_percentage=False, id="np-progress")
             yield Static("00:00 / 00:00", id="np-status")
-        yield DataTable(id="queue")
+        with Vertical(id="up-next"):
+            yield Static("—", id="next-title")
+            yield Static("", id="next-meta")
+        yield Static("", id="log-strip")
         yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#now-playing", Vertical).border_title = "Now Playing"
-        table = cast("DataTable[str]", self.query_one("#queue", DataTable))
-        table.border_title = "Trajectory"
-        table.cursor_type = "row"
-        table.add_columns("", "Track", "Score", "Intro", "Orbit")
+        self.query_one("#up-next", Vertical).border_title = "Up Next"
         self._refresh_from_mpv()
         self.set_interval(0.25, self._refresh_from_mpv)
 
@@ -407,7 +424,9 @@ class VibeApp(App[None]):
             except _IPC_ERRORS as err:
                 _log.debug("cover art attach failed for %s: %s", current.path, err)
 
-            if self.on_commit is not None and pos not in self._committed_indices:
+            if (self.on_commit is not None or self.play_log is not None) and (
+                pos not in self._committed_indices
+            ):
                 dur = self.state.duration
                 played_enough = self.state.time_pos >= self.commit_seconds or (
                     dur > 0.0 and (self.state.time_pos / dur) >= self.commit_fraction
@@ -416,7 +435,21 @@ class VibeApp(App[None]):
                     self._committed_indices.add(pos)
                     prev_committed = self._last_committed_path
                     self._last_committed_path = current.path
-                    self.on_commit(current.path, prev_committed)
+                    if self.on_commit is not None:
+                        self.on_commit(current.path, prev_committed)
+                    if self.play_log is not None:
+                        meta = self.meta_provider(current.path)
+                        try:
+                            self.play_log.append(
+                                current.path,
+                                meta.display,
+                                score=current.score,
+                                intro_sim=current.intro_sim,
+                                heat=current.heat,
+                            )
+                            self._logged_today += 1
+                        except OSError as err:
+                            _log.debug("daily play log write failed: %s", err)
 
         self._render_view()
 
@@ -458,21 +491,34 @@ class VibeApp(App[None]):
         )
         self.query_one("#np-status", Static).update(status_text)
 
-        table = cast("DataTable[str]", self.query_one("#queue", DataTable))
-        table.clear()
-        for idx, item in enumerate(self.session.entries):
-            marker = "▶" if idx == pos else ("✓" if idx < pos else "·")
-            orbit_col = f"{item.center:.2f}" if self.session.orbit_strength else "—"
-            table.add_row(
-                marker,
-                self.meta_provider(item.path).display,
-                f"{item.score:.2f}",
-                f"{item.intro_sim:.2f}",
-                orbit_col,
-                key=str(idx),
+        next_entry = (
+            self.session.entries[pos + 1] if (pos + 1) < len(self.session.entries) else None
+        )
+        if next_entry is not None:
+            next_meta = self.meta_provider(next_entry.path)
+            next_loc = next_meta.album or str(Path(next_entry.path).parent)
+            metrics = [
+                f"score {next_entry.score:.2f}",
+                f"intro {next_entry.intro_sim:.2f}",
+                f"heat {next_entry.heat:.2f}",
+            ]
+            if self.session.orbit_strength:
+                metrics.append(f"orbit {next_entry.center:.2f}")
+            self.query_one("#next-title", Static).update(next_meta.display)
+            self.query_one("#next-meta", Static).update(
+                "  •  ".join([p for p in [next_loc, *metrics] if p])
             )
-        if self.session.entries and 0 <= pos < len(self.session.entries):
-            table.move_cursor(row=pos)
+        else:
+            self.query_one("#next-title", Static).update("End of queue")
+            self.query_one("#next-meta", Static).update("")
+
+        if self.play_log is not None:
+            log_path = self.play_log.path_for()
+            self.query_one("#log-strip", Static).update(
+                f"log: {log_path}  ({self._logged_today} today)"
+            )
+        else:
+            self.query_one("#log-strip", Static).update("")
 
     def action_toggle_pause(self) -> None:
         self.controller.toggle_pause()

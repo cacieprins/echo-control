@@ -177,6 +177,7 @@ def run_vibe(
         from .cooldown import CooldownScorer, HeatField, TrailLog
         from .manifold import CorpusManifold
         from .players import play_mpv_tui
+        from .playlog import DailyPlayLog
         from .tui import QueueEntry, VibeSession
         from .wander import Orbit, Transition, walk, wander
 
@@ -194,6 +195,7 @@ def run_vibe(
             cache_path=CACHE_DIR / f"manifold_{cfg.qdrant.collection}.npz",
         )
         trails = TrailLog.load(STATE_DIR / "trails.json", cfg.wander)
+        play_log = DailyPlayLog(STATE_DIR / "logs")
         cooldown = CooldownScorer(
             manifold=manifold,
             heat_field=HeatField.from_config(cfg.wander),
@@ -236,6 +238,7 @@ def run_vibe(
                     title,
                     art_provider=lambda p: ensure_latent_art(p, store),
                     on_commit=lambda p, prev: cooldown.commit_play(p, prev, persist=True),
+                    play_log=play_log,
                     commit_seconds=cfg.wander.commit_seconds,
                     commit_fraction=cfg.wander.commit_fraction,
                 )
@@ -266,6 +269,7 @@ def run_vibe(
                 title,
                 art_provider=lambda p: ensure_latent_art(p, store),
                 on_commit=lambda p, prev: cooldown.commit_play(p, prev, persist=True),
+                play_log=play_log,
                 commit_seconds=cfg.wander.commit_seconds,
                 commit_fraction=cfg.wander.commit_fraction,
             )
