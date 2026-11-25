@@ -41,6 +41,7 @@ class VibeRequest:
     wander: bool = False
     orbit: float | None = None
     seed: str | None = None
+    auto: bool = False
     continuous: bool = False
     no_tui: bool = False
 
@@ -56,6 +57,10 @@ def validate_vibe(req: VibeRequest, cfg: Config) -> None:
         if req.orbit < 0:
             raise UsageError("--orbit strength can't be negative")
         req.wander = True
+    if req.auto:
+        req.wander = True
+        if req.seed or req.clean_query:
+            raise UsageError("--auto picks the starting track; don't combine it with --from or a query")
     if req.continuous:
         req.wander = True
         if req.as_json or req.print_m3u:
@@ -74,7 +79,7 @@ def validate_vibe(req: VibeRequest, cfg: Config) -> None:
         raise UsageError("--shuffle would undo the walk's ordering")
     if req.wander and not get_strategy(cfg.model).supports_wander:
         raise UsageError('--wander and --orbit need [model] strategy = "chunks"')
-    if not req.clean_query and not req.seed:
+    if not req.clean_query and not req.seed and not req.auto:
         raise UsageError(show_usage=True)
 
 
@@ -163,6 +168,8 @@ def run_vibe(
     scores: list[tuple[str, float]] = []
     if req.seed:
         seed = str(Path(req.seed).expanduser().resolve())
+    elif req.auto:
+        seed = ""
     else:
         assert vector is not None
         hits = store.search(vector, 1 if req.wander else limit)
@@ -173,15 +180,28 @@ def run_vibe(
 
     if req.wander:
         from .art import ensure_latent_art
+        from .atlas import LiveAtlasRenderer
         from .config import CACHE_DIR, STATE_DIR
-        from .cooldown import CooldownScorer, HeatField, TrailLog
+        from .cooldown import CooldownScorer, HeatField, TrailLog, coldest_track
         from .manifold import CorpusManifold
         from .players import play_mpv_tui
         from .playlog import DailyPlayLog
+        from .surfing import ChannelSurfer
         from .tui import QueueEntry, VibeSession
         from .wander import Orbit, Transition, walk, wander
 
         assert isinstance(store, ChunkIndex)
+        manifold = CorpusManifold.from_store(
+            store,
+            neighbors=cfg.wander.csls_neighbors,
+            cache_path=CACHE_DIR / f"manifold_{cfg.qdrant.collection}.npz",
+        )
+        trails = TrailLog.load(STATE_DIR / "trails.json", cfg.wander)
+        if req.auto:
+            if not manifold.paths:
+                raise EchoControlError("the index is empty; start the daemon or run `echo-control scan`")
+            seed = coldest_track(manifold, trails, cfg.wander)
+            notify(f"auto seed (coldest): {Path(seed).stem}")
         found = store.track(seed)
         if found is None:
             raise EchoControlError(f"{seed} isn't in the chunk index")
@@ -189,18 +209,21 @@ def run_vibe(
         if req.orbit is not None and req.orbit > 0:
             orbit = Orbit(vector or found[1]["mean"].tolist(), req.orbit)
 
-        manifold = CorpusManifold.from_store(
-            store,
-            neighbors=cfg.wander.csls_neighbors,
-            cache_path=CACHE_DIR / f"manifold_{cfg.qdrant.collection}.npz",
-        )
-        trails = TrailLog.load(STATE_DIR / "trails.json", cfg.wander)
         play_log = DailyPlayLog(STATE_DIR / "logs")
+        heat_field = HeatField.from_config(cfg.wander)
         cooldown = CooldownScorer(
             manifold=manifold,
-            heat_field=HeatField.from_config(cfg.wander),
+            heat_field=heat_field,
             trails=trails,
             cfg=cfg.wander,
+        )
+        surfer = ChannelSurfer(manifold=manifold, trails=trails, heat_field=heat_field)
+        live_atlas = LiveAtlasRenderer(
+            manifold=manifold,
+            trails=trails,
+            cfg=cfg,
+            log_dir=STATE_DIR / "logs",
+            cache_dir=CACHE_DIR,
         )
 
         use_tui = should_use_tui(req, cfg, is_tty=is_tty)
@@ -237,8 +260,10 @@ def run_vibe(
                     session,
                     title,
                     art_provider=lambda p: ensure_latent_art(p, store),
+                    map_provider=live_atlas.render,
                     on_commit=lambda p, prev: cooldown.commit_play(p, prev, persist=True),
                     play_log=play_log,
+                    surfer=surfer,
                     commit_seconds=cfg.wander.commit_seconds,
                     commit_fraction=cfg.wander.commit_fraction,
                 )
@@ -268,8 +293,10 @@ def run_vibe(
                 session,
                 title,
                 art_provider=lambda p: ensure_latent_art(p, store),
+                map_provider=live_atlas.render,
                 on_commit=lambda p, prev: cooldown.commit_play(p, prev, persist=True),
                 play_log=play_log,
+                surfer=surfer,
                 commit_seconds=cfg.wander.commit_seconds,
                 commit_fraction=cfg.wander.commit_fraction,
             )

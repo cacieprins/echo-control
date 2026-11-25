@@ -417,3 +417,157 @@ def test_vibe_app_listen_time_commit_gate(tmp_path: Path) -> None:
     asyncio.run(_run())
 
 
+def test_vibe_app_bail_and_warmer_hard_cut() -> None:
+    import numpy as np
+    from textual.widgets import Static
+
+    from echo_control.manifold import CorpusManifold
+    from echo_control.surfing import ChannelSurfer
+
+    rng = np.random.default_rng(7)
+    mat = rng.standard_normal((32, 8)).astype(np.float32)
+    mat /= np.linalg.norm(mat, axis=1, keepdims=True)
+    paths = [f"/music/t_{i:02d}.flac" for i in range(32)]
+    manifold = CorpusManifold.from_arrays(paths, mat, mat, neighbors=4)
+    surfer = ChannelSurfer(manifold=manifold)
+
+    ipc = FakeIpc()
+    ipc.props["playlist-pos"] = 0
+
+    def walk_factory(
+        _seed_path: str, _strength: float | None, _center_path: str | None
+    ) -> Iterator[Transition]:
+        yield _t("t_00")
+        yield _t("next-after-bail")
+        yield _t("next-after-bail-2")
+
+    session = tui.VibeSession(
+        entries=[tui.QueueEntry(path=paths[0], score=0.0, intro_sim=0.0)],
+        query="surf test",
+        continuous=True,
+        orbit_strength=1.0,
+        orbit_center_path=paths[0],
+        walk_factory=walk_factory,
+    )
+    app = tui.VibeApp(
+        session=session,
+        controller=tui.MpvController(ipc),
+        is_alive=lambda: True,
+        surfer=surfer,
+    )
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("b")
+            await pilot.pause()
+            # Hard cut issued loadfile <path> replace and updated orbit center
+            replace_cmds = [c for c in ipc.commands if c[0] == "loadfile" and c[2] == "replace"]
+            assert len(replace_cmds) == 1
+            cut_path = str(replace_cmds[0][1])
+            assert cut_path != paths[0]
+            assert session.entries[0].path == cut_path
+            assert session.orbit_center_path == cut_path
+            np_meta = str(app.query_one("#np-meta", Static).render())
+            assert "surf:" in np_meta
+
+            # Explicit [v] midpoint also issues hard cut
+            await pilot.press("v")
+            await pilot.pause()
+            replace_cmds = [c for c in ipc.commands if c[0] == "loadfile" and c[2] == "replace"]
+            assert len(replace_cmds) == 2
+
+    asyncio.run(_run())
+
+
+def test_vibe_app_prev_track_at_start_does_not_crash() -> None:
+    from echo_control.players import PlayerError
+
+    class BoundaryIpc(FakeIpc):
+        @override
+        def command(self, *args: Any) -> Any:
+            if args and args[0] in ("playlist-prev", "playlist-next"):
+                raise PlayerError(f"mpv {args[0]}: command failed")
+            return super().command(*args)
+
+    ipc = BoundaryIpc()
+    app = tui.VibeApp(
+        session=tui.VibeSession(entries=[tui.QueueEntry.from_transition(_t("only"))]),
+        controller=tui.MpvController(ipc),
+        is_alive=lambda: True,
+    )
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.press("n")
+            await pilot.pause()
+            assert app._exit is False  # pyright: ignore[reportPrivateUsage]
+
+    asyncio.run(_run())
+
+
+
+
+def test_mpv_controller_overlay_toggle_restores_embedded_and_latent(tmp_path: Path) -> None:
+    map_img = tmp_path / "live_atlas_0.png"
+    map_img.write_bytes(b"png")
+    latent_img = tmp_path / "latent.png"
+    latent_img.write_bytes(b"png")
+
+    # Case 1: Track has embedded album art (vid 1)
+    ipc = FakeIpc()
+    ipc.props["track-list"] = [
+        {"id": 1, "type": "video", "external": False},
+        {"id": 2, "type": "video", "external": True, "external-filename": str(map_img)},
+    ]
+    ctrl = tui.MpvController(ipc)
+    ctrl.show_overlay_image(map_img)
+    assert ("video-add", str(map_img), "select") in ipc.commands
+
+    ipc.commands.clear()
+    ctrl.clear_overlay_image("/music/a.mp3", lambda _: latent_img)
+    assert ("video-remove", 2) in ipc.commands
+    assert ("set_property", "vid", 1) in ipc.commands
+    assert ("video-add", str(latent_img), "select") not in ipc.commands
+
+    # Case 2: Track has NO embedded album art -> falls back to latent art_provider
+    ipc2 = FakeIpc()
+    ipc2.props["track-list"] = [
+        {"id": 3, "type": "video", "external": True, "external-filename": str(map_img)},
+    ]
+    ctrl2 = tui.MpvController(ipc2)
+    ctrl2.show_overlay_image(map_img)
+    ipc2.commands.clear()
+    ctrl2.clear_overlay_image("/music/b.mp3", lambda _: latent_img)
+    assert ("video-remove", 3) in ipc2.commands
+    assert ("video-add", str(latent_img), "select") in ipc2.commands
+
+
+def test_textual_vibe_app_map_hotkey(tmp_path: Path) -> None:
+    map_img = tmp_path / "live_atlas_0.png"
+    map_img.write_bytes(b"png")
+    ipc = FakeIpc()
+    ipc.props["track-list"] = [{"id": 1, "type": "video", "external": False}]
+    ctrl = tui.MpvController(ipc)
+    session = tui.VibeSession(entries=[tui.QueueEntry.from_transition(_t("seed"))])
+    app = tui.VibeApp(
+        session=session,
+        controller=ctrl,
+        is_alive=lambda: True,
+        map_provider=lambda _p, _nxt: map_img,
+    )
+
+    async def _run() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("m")
+            await pilot.pause(0.15)
+            assert ("video-add", str(map_img), "select") in ipc.commands
+            await pilot.press("m")
+            await pilot.pause()
+            assert ("set_property", "vid", 1) in ipc.commands
+            await pilot.press("q")
+
+    asyncio.run(_run())

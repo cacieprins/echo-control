@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -21,6 +22,7 @@ from textual.widgets import Footer, ProgressBar, Static
 
 from .errors import EchoControlError
 from .playlog import DailyPlayLog
+from .surfing import ChannelSurfer, SurfResult
 from .wander import Transition
 
 _log = logging.getLogger(__name__)
@@ -200,11 +202,22 @@ class VibeSession:
         self.orbit_center_path = center
         return self._reset_upcoming(pos, from_path, self.orbit_strength, center, ahead)
 
+    def hard_cut_to(self, path: str, ahead: int = CONTINUOUS_AHEAD) -> list[QueueEntry]:
+        """Reset playlist to a single hard-cut track at pos 0 and regenerate lookahead."""
+        self.entries = [QueueEntry(path=path, score=0.0, intro_sim=0.0)]
+        self.exhausted = False
+        if self.orbit_strength is not None and self.orbit_strength > 0.0:
+            self.orbit_center_path = path
+        if not self.continuous or self.walk_factory is None:
+            return []
+        return self._reset_upcoming(0, path, self.orbit_strength, self.orbit_center_path, ahead)
+
 
 class MpvController:
     def __init__(self, ipc: IpcClient) -> None:
         self.ipc: IpcClient = ipc
         self._last_art_path: str | None = None
+        self._overlay_image_path: str | None = None
 
     def _get(self, prop: str, default: Any = None) -> Any:
         try:
@@ -225,30 +238,43 @@ class MpvController:
             has_video=bool(vid),
         )
 
+    def _send(self, *args: Any) -> bool:
+        try:
+            self.ipc.command(*args)
+            return True
+        except _IPC_ERRORS as err:
+            _log.debug("mpv command %s failed: %s", args[0] if args else "", err)
+            return False
+
     def toggle_pause(self) -> None:
-        self.ipc.command("cycle", "pause")
+        self._send("cycle", "pause")
 
     def next_track(self) -> None:
-        self.ipc.command("playlist-next", "weak")
+        self._send("playlist-next", "weak")
 
     def prev_track(self) -> None:
-        self.ipc.command("playlist-prev", "weak")
+        self._send("playlist-prev", "weak")
 
     def seek(self, seconds: float) -> None:
-        self.ipc.command("seek", seconds, "relative")
+        self._send("seek", seconds, "relative")
 
     def change_volume(self, delta: float) -> None:
-        self.ipc.command("add", "volume", delta)
+        self._send("add", "volume", delta)
 
     def append_track(self, path: str) -> None:
-        self.ipc.command("loadfile", path, "append")
+        self._send("loadfile", path, "append")
+
+    def hard_cut(self, path: str) -> None:
+        """Instant 0 ms tuner cut: replace mpv playlist with `path`."""
+        self._last_art_path = None
+        self._send("loadfile", path, "replace")
 
     def replace_upcoming(self, current_pos: int, new_paths: list[str]) -> None:
         count = int(self._get("playlist-count", 0) or 0)
         for idx in range(count - 1, max(current_pos, 0), -1):
-            self.ipc.command("playlist-remove", idx)
+            self._send("playlist-remove", idx)
         for path in new_paths:
-            self.ipc.command("loadfile", path, "append")
+            self._send("loadfile", path, "append")
 
     def ensure_cover_art(
         self,
@@ -261,7 +287,52 @@ class MpvController:
         self._last_art_path = path
         art_path = art_provider(path)
         if art_path is not None:
-            self.ipc.command("video-add", str(art_path), "select")
+            self._send("video-add", str(art_path), "select")
+
+    def _track_list(self) -> list[dict[str, Any]]:
+        raw = self._get("track-list", [])
+        if not isinstance(raw, list):
+            return []
+        return [cast("dict[str, Any]", item) for item in cast("list[Any]", raw) if isinstance(item, dict)]
+
+    def _remove_external_video(self, filename: str) -> None:
+        for tr in self._track_list():
+            if (
+                tr.get("type") == "video"
+                and tr.get("external") is True
+                and tr.get("external-filename") == filename
+            ):
+                tid: Any = tr.get("id")
+                if tid is not None:
+                    self._send("video-remove", tid)
+
+    def show_overlay_image(self, image_path: Path) -> None:
+        """Display `image_path` as mpv's active video track, swapping seamlessly without flashing cover art."""
+        prev = self._overlay_image_path
+        target = str(image_path)
+        self._overlay_image_path = target
+        self._send("video-add", target, "select")
+        if prev is not None and prev != target:
+            self._remove_external_video(prev)
+
+    def clear_overlay_image(
+        self,
+        path: str,
+        art_provider: Callable[[str], Path | None] | None,
+    ) -> None:
+        """Remove any active overlay image and restore embedded or latent cover art."""
+        prev = self._overlay_image_path
+        self._overlay_image_path = None
+        self._last_art_path = None
+        if prev is not None:
+            self._remove_external_video(prev)
+        for tr in self._track_list():
+            if tr.get("type") == "video" and not tr.get("external"):
+                tid: Any = tr.get("id")
+                if tid is not None:
+                    self._send("set_property", "vid", tid)
+                    return
+        self.ensure_cover_art(path, False, art_provider)
 
 
 def _fmt_time(seconds: float) -> str:
@@ -339,6 +410,9 @@ class VibeApp(App[None]):
         Binding("o", "recenter_orbit", "Orbit here"),
         Binding("left_square_bracket", "orbit_weaker", "Orbit -"),
         Binding("right_square_bracket", "orbit_stronger", "Orbit +"),
+        Binding("b", "bail", "Bail"),
+        Binding("v", "warmer", "Midpoint"),
+        Binding("m", "toggle_map", "Map"),
         Binding("q", "quit", "Quit"),
         Binding("ctrl+c", "quit", "Quit", show=False, priority=True),
     ]
@@ -350,10 +424,12 @@ class VibeApp(App[None]):
         controller: MpvController,
         is_alive: Callable[[], bool],
         art_provider: Callable[[str], Path | None] | None = None,
+        map_provider: Callable[[str, str | None], Path | None] | None = None,
         meta_provider: Callable[[str], TrackMeta] = read_track_meta,
         ahead: int = CONTINUOUS_AHEAD,
         on_commit: Callable[[str, str | None], None] | None = None,
         play_log: DailyPlayLog | None = None,
+        surfer: ChannelSurfer | None = None,
         commit_seconds: float = 30.0,
         commit_fraction: float = 0.40,
     ) -> None:
@@ -363,16 +439,23 @@ class VibeApp(App[None]):
         self.controller: MpvController = controller
         self.is_alive: Callable[[], bool] = is_alive
         self.art_provider: Callable[[str], Path | None] | None = art_provider
+        self.map_provider: Callable[[str, str | None], Path | None] | None = map_provider
         self.meta_provider: Callable[[str], TrackMeta] = meta_provider
         self.ahead: int = ahead
         self.on_commit: Callable[[str, str | None], None] | None = on_commit
         self.play_log: DailyPlayLog | None = play_log
+        self.surfer: ChannelSurfer | None = surfer
         self.commit_seconds: float = commit_seconds
         self.commit_fraction: float = commit_fraction
         self.state: PlaybackState = PlaybackState()
         self._committed_indices: set[int] = set()
         self._last_committed_path: str | None = None
         self._logged_today: int = play_log.count_today() if play_log is not None else 0
+        self._map_mode: bool = False
+        self._map_key: tuple[str, str | None, int] | None = None
+        self._map_rendering: bool = False
+        self._last_map_image: Path | None = None
+        self._last_map_track: str | None = None
 
     @override
     def compose(self) -> ComposeResult:
@@ -417,12 +500,29 @@ class VibeApp(App[None]):
             self.state.duration > 0 or bool(self.state.media_title)
         ):
             current = self.session.entries[pos]
-            try:
-                self.controller.ensure_cover_art(
-                    current.path, self.state.has_video, self.art_provider
+            if self._map_mode and self.map_provider is not None:
+                if current.path != self._last_map_track and self._last_map_image is not None:
+                    # Immediately re-attach the last map frame so mpv doesn't flash embedded cover art
+                    self._last_map_track = current.path
+                    try:
+                        self.controller.show_overlay_image(self._last_map_image)
+                    except _IPC_ERRORS as err:
+                        _log.debug("immediate map re-attach failed: %s", err)
+                next_path = (
+                    self.session.entries[pos + 1].path
+                    if (pos + 1) < len(self.session.entries)
+                    else None
                 )
-            except _IPC_ERRORS as err:
-                _log.debug("cover art attach failed for %s: %s", current.path, err)
+                key = (current.path, next_path, self._logged_today)
+                if key != self._map_key and not self._map_rendering:
+                    self._request_map_render(current.path, next_path, key)
+            else:
+                try:
+                    self.controller.ensure_cover_art(
+                        current.path, self.state.has_video, self.art_provider
+                    )
+                except _IPC_ERRORS as err:
+                    _log.debug("cover art attach failed for %s: %s", current.path, err)
 
             if (self.on_commit is not None or self.play_log is not None) and (
                 pos not in self._committed_indices
@@ -475,6 +575,12 @@ class VibeApp(App[None]):
             badges.append(f"center: {center_name}")
         if self.session.continuous:
             badges.append("continuous")
+        if self.surfer is not None:
+            surf_badge = self.surfer.status_badge()
+            if surf_badge:
+                badges.append(surf_badge)
+        if self._map_mode:
+            badges.append("map…" if self._map_rendering else "map")
 
         self.query_one("#np-title", Static).update(title)
         meta_line = "  •  ".join([b for b in [location, *badges] if b])
@@ -561,3 +667,93 @@ class VibeApp(App[None]):
         if added:
             self.controller.replace_upcoming(pos, [e.path for e in added])
             self._render_view()
+
+    def _apply_surf(self, result: SurfResult | None) -> None:
+        if result is None:
+            return
+        self.controller.hard_cut(result.path)
+        added = self.session.hard_cut_to(result.path, ahead=self.ahead)
+        for entry in added:
+            try:
+                self.controller.append_track(entry.path)
+            except _IPC_ERRORS:
+                break
+        self._committed_indices.clear()
+        self._last_committed_path = None
+        self.state.pos = 0
+        self.state.time_pos = 0.0
+        self._render_view()
+
+    def action_bail(self) -> None:
+        if self.surfer is None or not self.session.entries:
+            return
+        pos = max(0, min(self.state.pos, len(self.session.entries) - 1))
+        self._apply_surf(self.surfer.bail(self.session.entries[pos].path))
+
+    def action_warmer(self) -> None:
+        if self.surfer is None or not self.session.entries:
+            return
+        pos = max(0, min(self.state.pos, len(self.session.entries) - 1))
+        self._apply_surf(self.surfer.warmer(self.session.entries[pos].path))
+
+    def _request_map_render(
+        self, track_path: str, next_path: str | None, key: tuple[str, str | None, int]
+    ) -> None:
+        provider = self.map_provider
+        if provider is None:
+            return
+        self._map_rendering = True
+
+        def _worker() -> None:
+            img: Path | None = None
+            try:
+                img = provider(track_path, next_path)
+            except _IPC_ERRORS as err:
+                _log.debug("live atlas render failed: %s", err)
+            try:
+                self.call_from_thread(self._apply_map_image, img, key)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_map_image(
+        self, image_path: Path | None, key: tuple[str, str | None, int]
+    ) -> None:
+        self._map_rendering = False
+        if not self._map_mode or image_path is None:
+            self._render_view()
+            return
+        self._map_key = key
+        self._last_map_image = image_path
+        self._last_map_track = key[0]
+        try:
+            self.controller.show_overlay_image(image_path)
+        except _IPC_ERRORS as err:
+            _log.debug("map overlay attach failed: %s", err)
+        self._render_view()
+
+    def action_toggle_map(self) -> None:
+        if self.map_provider is None or not self.session.entries:
+            return
+        pos = max(0, min(self.state.pos, len(self.session.entries) - 1))
+        current_path = self.session.entries[pos].path
+        next_path = (
+            self.session.entries[pos + 1].path
+            if (pos + 1) < len(self.session.entries)
+            else None
+        )
+        self._map_mode = not self._map_mode
+        if self._map_mode:
+            self._map_key = None
+            if not self._map_rendering:
+                self._request_map_render(
+                    current_path, next_path, (current_path, next_path, self._logged_today)
+                )
+        else:
+            self._map_key = None
+            try:
+                self.controller.clear_overlay_image(current_path, self.art_provider)
+            except _IPC_ERRORS as err:
+                _log.debug("restore cover art failed: %s", err)
+        self._render_view()

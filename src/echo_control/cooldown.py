@@ -296,3 +296,56 @@ def sample_next[T: _Scored](
     gen = rng if rng is not None else np.random.default_rng()
     idx = int(gen.choice(len(pool), p=probs))
     return pool[idx]
+
+
+def coldest_track(
+    manifold: CorpusManifold,
+    trails: TrailLog,
+    cfg: WanderConfig | None = None,
+    *,
+    heat_field: HeatField | None = None,
+    now: float | None = None,
+    rng: np.random.Generator | None = None,
+) -> str:
+    """Return the path of the coldest track on the manifold.
+
+    Combines each track's direct persistent node heat with smooth macro-scale
+    spatial heat diffused from all recently played tracks in `trails` (and any
+    active in-session `heat_field`). When no heat history exists, picks a
+    random track so cold-start runs don't always start on the same file.
+    """
+    n = len(manifold.paths)
+    if n == 0:
+        raise ValueError("cannot pick coldest track from an empty manifold")
+
+    c = cfg or WanderConfig()
+    t = time.time() if now is None else now
+    total = np.array([trails.node_heat(p, now=t) for p in manifold.paths], dtype=np.float64)
+
+    hot_indices: list[int] = []
+    hot_weights: list[float] = []
+    for p in trails.nodes:
+        idx = manifold.index.get(p)
+        if idx is None:
+            continue
+        w = trails.node_heat(p, now=t)
+        if w > 0.0:
+            hot_indices.append(idx)
+            hot_weights.append(w)
+
+    if hot_indices:
+        h_vecs = manifold.means[hot_indices]
+        h_w = np.array(hot_weights, dtype=np.float64)
+        dists = np.maximum(0.0, 1.0 - manifold.means.astype(np.float64) @ h_vecs.astype(np.float64).T)
+        macro_denom = c.macro_sigma * c.macro_sigma
+        total += np.exp(-dists / macro_denom) @ h_w
+
+    if heat_field is not None and heat_field._history:  # pyright: ignore[reportPrivateUsage]
+        for i in range(n):
+            total[i] += c.heat_weight * heat_field.heat(manifold.means[i])
+
+    if not hot_indices and (heat_field is None or not heat_field._history):  # pyright: ignore[reportPrivateUsage]
+        gen = rng if rng is not None else np.random.default_rng()
+        return manifold.paths[int(gen.integers(0, n))]
+
+    return manifold.paths[int(np.argmin(total))]

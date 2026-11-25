@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 from typing import NoReturn
 
-from . import commands
+from . import atlas, commands
 from . import config as config_mod
 from .errors import EchoControlError, UsageError
 from .players import BACKENDS
@@ -50,6 +51,11 @@ def vibe(argv: list[str] | None = None) -> None:
     )
     p.add_argument("--from", dest="seed", metavar="FILE", help="seed track for --wander/--orbit")
     p.add_argument(
+        "--auto",
+        action="store_true",
+        help="start wandering from the coldest track in the manifold (implies --wander)",
+    )
+    p.add_argument(
         "--continuous",
         action="store_true",
         help="keep wandering (or orbiting) forever in mpv, queueing tracks as they play",
@@ -72,6 +78,7 @@ def vibe(argv: list[str] | None = None) -> None:
         wander=args.wander,
         orbit=args.orbit,
         seed=args.seed,
+        auto=args.auto,
         continuous=args.continuous,
         no_tui=args.no_tui,
     )
@@ -95,6 +102,24 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("status", help="show daemon, Qdrant and index state")
     sub.add_parser("install-service", help="install docker-compose and systemd user units")
     sub.add_parser("install-noctalia", help="register and enable the Noctalia launcher plugin")
+    mp = sub.add_parser("map", help="render a 2D library atlas or local topographic heat map")
+    mp.add_argument("-o", "--output", type=Path, help="output file (.png or .svg)")
+    mp.add_argument(
+        "-k", "--clusters", type=int, default=15, help="number of 512D spherical clusters (default 15)"
+    )
+    mp.add_argument("--highlight", metavar="TEXT", help="highlight matching tracks with pink rings")
+    mp.add_argument(
+        "--focus",
+        metavar="TEXT",
+        help="render a local 2D spherical topographic heat map around tracks matching TEXT",
+    )
+    mp.add_argument("--date", metavar="YYYY-MM-DD", help="play log date to overlay (default today)")
+    mp.add_argument(
+        "--recent",
+        action="store_true",
+        help="label the last 3 played tracks with callouts instead of cluster labels",
+    )
+    mp.add_argument("--open", action="store_true", help="open the rendered map with xdg-open")
     args = p.parse_args(argv)
 
     try:
@@ -114,6 +139,18 @@ def main(argv: list[str] | None = None) -> None:
                 print(line)
         elif args.cmd == "status":
             print(commands.format_status(commands.collect_status(cfg)))
+        elif args.cmd == "map":
+            written = atlas.generate_map(
+                cfg,
+                output=args.output,
+                clusters=args.clusters,
+                highlight=args.highlight,
+                focus=args.focus,
+                date=args.date,
+                open_after=args.open,
+                label_mode="recent" if args.recent else "clusters",
+            )
+            print(written)
     except EchoControlError as e:
         _fail(e, p)
     except KeyboardInterrupt:

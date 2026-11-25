@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 if TYPE_CHECKING:
     from .playlog import DailyPlayLog
+    from .surfing import ChannelSurfer
     from .tui import VibeSession
 
 from .config import DATA_DIR, PlayerConfig, socket_path
@@ -204,9 +205,11 @@ def play_mpv_tui(
     session: VibeSession,
     title: str,
     art_provider: Callable[[str], Path | None] | None = None,
+    map_provider: Callable[[str, str | None], Path | None] | None = None,
     ahead: int = CONTINUOUS_AHEAD,
     on_commit: Callable[[str, str | None], None] | None = None,
     play_log: DailyPlayLog | None = None,
+    surfer: ChannelSurfer | None = None,
     commit_seconds: float = 30.0,
     commit_fraction: float = 0.40,
 ) -> None:
@@ -235,9 +238,11 @@ def play_mpv_tui(
                 controller=MpvController(ipc),
                 is_alive=lambda: proc.poll() is None,
                 art_provider=art_provider,
+                map_provider=map_provider,
                 ahead=ahead,
                 on_commit=on_commit,
                 play_log=play_log,
+                surfer=surfer,
                 commit_seconds=commit_seconds,
                 commit_fraction=commit_fraction,
             )

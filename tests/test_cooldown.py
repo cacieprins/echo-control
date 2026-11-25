@@ -143,3 +143,29 @@ def test_cooldown_breaks_hub_dominance_and_edge_ruts(tmp_path: Path) -> None:
     chain = wander(store, "/seed", 2, cfg, cooldown=scorer, update_heat_on_step=True)
     assert chain[0].path == "/seed"
     assert chain[1].path != "/bridge"
+
+
+def test_coldest_track_picks_furthest_from_hot_region() -> None:
+    from echo_control.cooldown import coldest_track
+    from echo_control.manifold import CorpusManifold
+
+    # Three orthogonal tracks: track 0 is hot, track 1 is near track 0, track 2 is orthogonal (coldest)
+    paths = ["/music/hot.mp3", "/music/warm.mp3", "/music/cold.mp3"]
+    vecs = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.95, 0.3122, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    manifold = CorpusManifold.from_arrays(paths, vecs, vecs, neighbors=2)
+    trails = TrailLog()
+    trails.commit("/music/hot.mp3", now=1000.0, save=False)
+
+    assert coldest_track(manifold, trails, WanderConfig(), now=1005.0) == "/music/cold.mp3"
+
+    # Empty trails falls back to random selection within manifold
+    empty_trails = TrailLog()
+    pick = coldest_track(manifold, empty_trails, WanderConfig(), rng=np.random.default_rng(0))
+    assert pick in paths
