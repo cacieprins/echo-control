@@ -26,6 +26,8 @@ class StrategyName(StrEnum):
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "echo-control"
 CONFIG_PATH = CONFIG_DIR / "config.toml"
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "echo-control"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "echo-control"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "echo-control"
 
 
 def socket_path() -> Path:
@@ -86,9 +88,27 @@ class WanderConfig:
     position: float = 1.0
     direction: float = 0.5
     drift: float = 0.25
-    candidates: int = 100
+    candidates: int = 128
     duplicate_similarity: float = 0.95
     duplicate_alignment: float = 0.92
+    # Cooldown manifold & sampling
+    csls_gamma: float = 0.40
+    csls_neighbors: int = 20
+    heat_weight: float = 0.35
+    micro_sigma: float = 0.10
+    micro_tau: float = 15.0
+    macro_sigma: float = 0.30
+    macro_beta: float = 0.20
+    macro_alpha: float = 0.80
+    edge_wear_step: float = 0.25
+    edge_halflife_days: float = 14.0
+    node_heat_step: float = 0.15
+    node_halflife_hours: float = 60.0
+    commit_seconds: float = 30.0
+    commit_fraction: float = 0.40
+    softmax_k: int = 6
+    softmax_margin: float = 0.06
+    softmax_temp: float = 0.02
 
 
 @dataclass
@@ -191,12 +211,28 @@ def load(path: Path | None = None) -> Config:
     if search.sustain_seconds <= 0:
         raise ConfigError("[search] sustain_seconds must be > 0")
 
+    wander = WanderConfig(**raw.get("wander", {}))
+    if wander.candidates <= 0:
+        raise ConfigError("[wander] candidates must be > 0")
+    if wander.csls_neighbors < 0:
+        raise ConfigError("[wander] csls_neighbors must be >= 0")
+    if wander.micro_sigma <= 0 or wander.macro_sigma <= 0:
+        raise ConfigError("[wander] micro_sigma and macro_sigma must be > 0")
+    if wander.micro_tau <= 0:
+        raise ConfigError("[wander] micro_tau must be > 0")
+    if not 0.0 <= wander.macro_alpha < 1.0:
+        raise ConfigError("[wander] macro_alpha must be in [0, 1)")
+    if wander.edge_halflife_days <= 0 or wander.node_halflife_hours <= 0:
+        raise ConfigError("[wander] halflife values must be > 0")
+    if wander.softmax_k <= 0 or wander.softmax_temp < 0 or wander.softmax_margin < 0:
+        raise ConfigError("[wander] softmax_k must be > 0 and softmax_temp/margin >= 0")
+
     return Config(
         library=library,
         model=model,
         qdrant=QdrantConfig(**raw.get("qdrant", {})),
         player=player,
         search=search,
-        wander=WanderConfig(**raw.get("wander", {})),
+        wander=wander,
         path=path if path.exists() else None,
     )

@@ -849,3 +849,19 @@ def test_daemon_collaborators_and_handle(
 
 
 
+
+
+def test_vibe_auto_flag_validation() -> None:
+    from echo_control import commands
+    from echo_control.errors import UsageError
+
+    cfg = Config()
+    req = commands.VibeRequest(auto=True)
+    commands.validate_vibe(req, cfg)
+    assert req.wander is True
+
+    with pytest.raises(UsageError, match="--auto"):
+        commands.validate_vibe(commands.VibeRequest(auto=True, seed="/music/a.mp3"), cfg)
+
+    with pytest.raises(UsageError, match="--auto"):
+        commands.validate_vibe(commands.VibeRequest(auto=True, query=["rain"]), cfg)

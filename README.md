@@ -24,6 +24,9 @@ vibe --orbit --from ~/Music/album/opener.flac
 
 # Endless walk in mpv, keeping 3 tracks queued ahead over mpv's IPC socket
 vibe --continuous --orbit=1.5 --from ~/Music/album/opener.flac
+
+# Start an endless walk from the coldest track in the manifold
+vibe --auto --continuous
 ```
 
 Tags and metadata are never read; transitions and similarity come purely from how the audio moves
@@ -162,6 +165,48 @@ toward a fixed center (the `--from` seed track, or a text query):
 - Injects the `candidates` tracks closest to the center into the pool at every step, so the walk
   can bend back even if every intro near the current outro has drifted far away.
 
+### Cooldown Manifold, Heat & Sampling
+
+To keep long walks from looping through the same high-hubness tracks or albums, `[wander]` subtracts
+a cooldown penalty from each candidate's transition score and samples from the top candidates:
+
+- **CSLS hubness penalty (`csls_gamma = 0.40`):** Penalizes tracks whose intros sit close to many
+  neighbors (`csls_neighbors = 20`) in the corpus manifold, cached in
+  `~/.cache/echo-control/manifold_<collection>.npz`.
+- **Dual-scale in-session heat field (`heat_weight = 0.35`):** Tracks played in the current session
+  deposit a sharp micro kernel (`micro_sigma = 0.10`, `micro_tau = 15`) plus a broader macro EMA
+  (`macro_sigma = 0.30`, `macro_beta = 0.20`, `macro_alpha = 0.80`) on the unit sphere.
+- **Persistent trail wear (`~/.local/state/echo-control/trails.json`):** Once a track passes the
+  listen-time commit gate (`commit_seconds = 30` or `commit_fraction = 0.40`), it records decaying
+  node heat (`node_heat_step = 0.15`, 60h half-life) and directed edge wear
+  (`edge_wear_step = 0.25`, 14d half-life), and appends a line to the daily play log at
+  `~/.local/state/echo-control/logs/YYYY-MM-DD.log`.
+- **Close-call Boltzmann sampling (`softmax_k = 6`, `softmax_margin = 0.06`, `softmax_temp = 0.02`):**
+  Samples probabilistically among near-tied top transitions instead of always taking the strict argmax.
+
+### Interactive TUI, Channel Surfing & Live Radar (`vibe`)
+
+When running `vibe --wander`, `--orbit`, `--auto`, or `--continuous` in an interactive terminal with
+`mpv`, `vibe` launches a Textual TUI alongside mpv (pass `--no-tui` for plain mpv). Tracks without
+embedded cover art automatically receive generated latent-space art.
+
+| Key | Action |
+| --- | --- |
+| `space` | Pause / play |
+| `n` / `p` | Next / previous track |
+| `←` / `→` | Seek −5s / +5s |
+| `+` / `-` | Volume +5% / −5% |
+| `o` | Re-center orbit on the current track |
+| `[` / `]` | Weaken / strengthen orbit pull (`±0.25`) |
+| `b` | **Bail (channel surf):** hard-cut via spherical bisection away from the current region |
+| `v` | **Midpoint:** hard-cut to the geodesic midpoint between the previous and current track |
+| `m` | **Map mode:** toggle mpv's window between cover art and a live Doppler library radar |
+| `q` | Quit |
+
+In **Map mode (`m`)**, mpv displays a live 2D Doppler heat map of your library with fading
+Catmull-Rom splines for the current session, a leading arrow from `NOW` to `Up Next`, and a Recent
+Trail sidebar, refreshing automatically as tracks play.
+
 ### Duplicate Detection
 
 Walks skip tracks with no audible windows, and never play another copy of a track already in the
@@ -175,6 +220,9 @@ they share. An alignment of at least `duplicate_alignment` (0.92) counts as the 
 
 ## Commands
 
+- `vibe --auto` starts wandering from the coldest track on the manifold (combines persistent node
+  heat with macro-scale spatial heat diffused from `trails.json`). Composes with `--continuous`,
+  `--orbit`, `--print`, and `--json`.
 - `vibe --wander --from FILE` (or `vibe --wander "<query>"`) chains tracks from `FILE` (or the top
   query hit). Requires `[model] strategy = "chunks"` (the default).
 - `vibe --orbit[=N] --from FILE` (or `vibe --orbit[=N] "<query>"`) wanders with a pull of strength
@@ -184,8 +232,13 @@ they share. An alignment of at least `duplicate_alignment` (0.92) counts as the 
   background.
 - `vibe "<query>"` runs a direct text-to-audio search and plays the top matches.
 - Common `vibe` flags: `-n/--limit`, `--player {mpv,spotatui,command,stdout}`, `--shuffle`,
-  `--print` (M3U to stdout), `--json`, `--detach`, `--play-path FILE...`. Piping stdout automatically
-  outputs an M3U instead of launching a player.
+  `--print` (M3U to stdout), `--json`, `--detach`, `--no-tui`, `--play-path FILE...`. Piping stdout
+  automatically outputs an M3U instead of launching a player.
+- `echo-control map` renders a 2D Doppler library atlas (`.png` via `rsvg-convert`, or `.svg`) with
+  512D spherical clusters, active heat, and fading session splines. Flags: `-o/--output PATH`,
+  `-k/--clusters N` (default `15`), `--highlight TEXT` (pink-ring matching tracks), `--focus TEXT`
+  (local 2D spherical topographic heat map + radial kernel profile), `--recent` (Recent Trail
+  sidebar instead of cluster labels), `--date YYYY-MM-DD`, and `--open`.
 - `echo-control daemon` runs the `inotify` watcher and local socket. Scans and file changes run in a
   short-lived child process that loads the GPU encoders and exits so ROCm's runtime thread doesn't
   spin on a CPU core between scans.

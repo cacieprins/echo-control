@@ -104,6 +104,7 @@ class ChunkIndex(VectorIndex, Protocol):
     ) -> None: ...
     def track(self, path: str) -> tuple[dict[str, Any], dict[str, np.ndarray]] | None: ...
     def chunk_vectors(self, path: str) -> np.ndarray: ...
+    def all_track_vectors(self) -> tuple[list[str], np.ndarray, np.ndarray]: ...
     def intros_near(self, vector: np.ndarray, limit: int, exclude: list[str]) -> list[Candidate]: ...
     def intros_of(self, vector: np.ndarray, paths: list[str]) -> list[Candidate]: ...
     def sustained(self, vector: list[float], paths: list[str]) -> dict[str, float]: ...
@@ -396,6 +397,45 @@ class ChunkStore:
                 break
         all_points.sort(key=lambda p: (p.payload or {}).get("idx", 0))
         return np.array([p.vector for p in all_points], dtype=np.float32)
+
+    def all_track_vectors(self) -> tuple[list[str], np.ndarray, np.ndarray]:
+        """All non-silent tracks' (paths, mean_vecs, intro_vecs) sorted by path."""
+        rows: list[tuple[str, np.ndarray, np.ndarray]] = []
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                self.tracks,
+                limit=SCROLL_BATCH,
+                offset=offset,
+                with_payload=["path", "silent"],
+                with_vectors=["mean", "intro"],
+            )
+            for p in points:
+                pl = p.payload or {}
+                if pl.get("silent") is True:
+                    continue
+                path = pl.get("path")
+                if not isinstance(path, str) or not isinstance(p.vector, dict):
+                    continue
+                mean_v = p.vector.get("mean")
+                intro_v = p.vector.get("intro")
+                if mean_v is None or intro_v is None:
+                    continue
+                rows.append((
+                    path,
+                    np.asarray(mean_v, dtype=np.float32),
+                    np.asarray(intro_v, dtype=np.float32),
+                ))
+            if offset is None:
+                break
+        if not rows:
+            empty = np.empty((0, 0), dtype=np.float32)
+            return [], empty, empty
+        rows.sort(key=lambda r: r[0])
+        paths = [r[0] for r in rows]
+        means = np.stack([r[1] for r in rows], axis=0)
+        intros = np.stack([r[2] for r in rows], axis=0)
+        return paths, means, intros
 
     @staticmethod
     def _to_candidates(
